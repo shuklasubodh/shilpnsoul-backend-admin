@@ -4,7 +4,7 @@ import bcrypt from 'bcrypt';
 import sql from './db.js';
 const scrypt=promisify(crypto.scrypt);
 const equal=(a,b)=>{const x=Buffer.from(String(a)),y=Buffer.from(String(b));return x.length===y.length&&crypto.timingSafeEqual(x,y)};
-const secret=()=>{const s=process.env.AUTH_SECRET;if(!s||s.length<32)throw new Error('AUTH_SECRET must have at least 32 characters');return s};
+const secret=()=>{const configured=process.env.AUTH_SECRET;if(configured?.length>=32)return configured;const connection=process.env.DATABASE_URL||process.env.POSTGRES_URL;if(!connection)throw new Error('AUTH_SECRET or DATABASE_URL must be configured');return crypto.createHash('sha256').update(`shilpnsoul-session:${connection}`).digest('hex')};
 export async function hashPassword(password){const salt=crypto.randomBytes(16).toString('hex');const key=await scrypt(password,salt,64);return `scrypt$${salt}$${key.toString('hex')}`}
 export async function verifyPassword(password,hash){const stored=String(hash||'');if(/^\$2[aby]\$\d{2}\$.{53}$/.test(stored))return bcrypt.compare(String(password),stored);const [a,salt,want]=stored.split('$');if(a!=='scrypt'||!/^[a-f\d]{32}$/i.test(salt)||!/^[a-f\d]{128}$/i.test(want))return false;const got=await scrypt(password,salt,64);return equal(got.toString('hex'),want)}
 export function tokenFor(user){const p=Buffer.from(JSON.stringify({sub:String(user.id),exp:Date.now()+86400000})).toString('base64url');return `${p}.${crypto.createHmac('sha256',secret()).update(p).digest('base64url')}`}

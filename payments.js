@@ -54,7 +54,7 @@ const router=Router();
 router.use(authenticate);
 router.post('/orders/:id/checkout',async(req,res)=>{
   if(!isId(req.params.id))return notFound(res,'Order');
-  const order=(await sql`SELECT id,user_id,order_number,total_amount,contact_email,payment_method,payment_status,status FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
+  const order=(await sql`SELECT id,user_id,order_number,total_amount,payment_method,payment_status,status FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
   if(!order)return notFound(res,'Order');
   if(order.payment_status==='PAID')return res.status(409).json({error:'Order is already paid.'});
   if(order.status==='CANCELLED')return res.status(409).json({error:'Cancelled orders cannot be paid.'});
@@ -71,7 +71,7 @@ router.post('/orders/:id/checkout',async(req,res)=>{
   const session=await stripe.checkout.sessions.create({
     mode:'payment',
     automatic_payment_methods:{enabled:true},
-    customer_email:order.contact_email||req.user.email,
+    customer_email:req.user.email,
     client_reference_id:String(order.id),
     metadata:{order_id:String(order.id),order_number:order.order_number,user_id:String(req.user.id)},
     line_items:[{quantity:1,price_data:{currency:currency(),unit_amount:minorUnits(order.total_amount),product_data:{name:`Order ${order.order_number}`}}}],

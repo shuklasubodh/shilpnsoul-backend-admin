@@ -23,7 +23,7 @@ router.post('/orders',async(req,res)=>{
     total+=Number(product.price)*quantity;
   }
   const number=`ORD-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
-  const order=(await sql`INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,payment_method,payment_status) VALUES(${req.user.id},${number},'PENDING',${shipping_name},${shipping_phone},${shipping_address},${total.toFixed(2)},${req.body.contact_email||req.user.email},${req.body.contact_phone||req.user.phone||shipping_phone},${paymentMethod},'UNPAID') RETURNING *`)[0];
+  const order=(await sql`INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,payment_method,payment_status) VALUES(${req.user.id},${number},'PENDING',${shipping_name},${shipping_phone},${shipping_address},${total.toFixed(2)},${paymentMethod},'UNPAID') RETURNING *`)[0];
   for(const item of prepared){
     await sql`INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price,subtotal) VALUES(${order.id},${item.product.id},${item.product.name},${item.quantity},${item.product.price},${item.subtotal.toFixed(2)}`;
     await sql`UPDATE products SET stock_quantity=stock_quantity-${item.quantity},updated_at=NOW() WHERE id=${item.product.id}`;

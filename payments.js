@@ -70,7 +70,7 @@ router.post('/orders/:id/checkout',async(req,res)=>{
   const attempts=(await sql`SELECT COUNT(*)::int AS count FROM payments WHERE order_id=${order.id}`)[0].count;
   const session=await stripe.checkout.sessions.create({
     mode:'payment',
-    automatic_payment_methods:{enabled:true},
+    payment_method_types:['card','paynow'],
     customer_email:order.contact_email||req.user.email,
     client_reference_id:String(order.id),
     metadata:{order_id:String(order.id),order_number:order.order_number,user_id:String(req.user.id)},

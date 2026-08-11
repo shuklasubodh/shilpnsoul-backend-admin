@@ -4,9 +4,21 @@ import sql from './db.js';
 import {authenticate,admin} from './auth.js';
 import {isId,notFound} from './utils.js';
 
+let client;
+let accountVerification;
 const stripeClient=()=>{
   if(!process.env.STRIPE_SECRET_KEY)throw Object.assign(new Error('Stripe is not configured.'),{code:'STRIPE_CONFIG_MISSING'});
-  return new Stripe(process.env.STRIPE_SECRET_KEY);
+  return client||(client=new Stripe(process.env.STRIPE_SECRET_KEY));
+};
+const verifiedStripeClient=async()=>{
+  const expected=String(process.env.STRIPE_ACCOUNT_ID||'').trim();
+  if(!/^acct_[A-Za-z0-9]+$/.test(expected))throw Object.assign(new Error('STRIPE_ACCOUNT_ID is not configured.'),{code:'STRIPE_CONFIG_MISSING'});
+  const stripe=stripeClient();
+  accountVerification||=stripe.accounts.retrieve().then(account=>{
+    if(account.id!==expected)throw Object.assign(new Error('Stripe secret key does not belong to the approved Stripe account.'),{code:'STRIPE_ACCOUNT_MISMATCH'});
+    return stripe;
+  }).catch(error=>{accountVerification=undefined;throw error});
+  return accountVerification;
 };
 const currency=()=>String(process.env.STRIPE_CURRENCY||'sgd').toLowerCase();
 const minorUnits=value=>Math.round(Number(value)*100);
@@ -16,8 +28,9 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
   if(!process.env.STRIPE_WEBHOOK_SECRET)return res.status(503).json({error:'Stripe webhook is not configured.'});
   const signature=req.get('stripe-signature');
   if(!signature)return res.status(400).json({error:'Missing Stripe signature.'});
+  const stripe=await verifiedStripeClient();
   let event;
-  try{event=stripeClient().webhooks.constructEvent(req.body,signature,process.env.STRIPE_WEBHOOK_SECRET)}
+  try{event=stripe.webhooks.constructEvent(req.body,signature,process.env.STRIPE_WEBHOOK_SECRET)}
   catch{return res.status(400).json({error:'Invalid Stripe signature.'})}
 
   const session=event.data.object;
@@ -47,14 +60,15 @@ router.post('/orders/:id/checkout',async(req,res)=>{
   if(order.status==='CANCELLED')return res.status(409).json({error:'Cancelled orders cannot be paid.'});
   const successUrl=process.env.PAYMENT_SUCCESS_URL,cancelUrl=process.env.PAYMENT_CANCEL_URL;
   if(!successUrl||!cancelUrl)throw Object.assign(new Error('Payment return URLs are not configured.'),{code:'STRIPE_CONFIG_MISSING'});
+  const stripe=await verifiedStripeClient();
 
   const existing=(await sql`SELECT stripe_checkout_session_id FROM payments WHERE order_id=${order.id} AND status='PENDING' ORDER BY id DESC LIMIT 1`)[0];
   if(existing){
-    const previous=await stripeClient().checkout.sessions.retrieve(existing.stripe_checkout_session_id);
+    const previous=await stripe.checkout.sessions.retrieve(existing.stripe_checkout_session_id);
     if(previous.status==='open'&&previous.url)return res.json({checkout_url:previous.url,session_id:previous.id});
   }
   const attempts=(await sql`SELECT COUNT(*)::int AS count FROM payments WHERE order_id=${order.id}`)[0].count;
-  const session=await stripeClient().checkout.sessions.create({
+  const session=await stripe.checkout.sessions.create({
     mode:'payment',
     automatic_payment_methods:{enabled:true},
     customer_email:order.contact_email||req.user.email,

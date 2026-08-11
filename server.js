@@ -29,6 +29,7 @@ app.use((req,res)=>res.status(404).json({error:'Endpoint not found.'}));
 app.use((error,req,res,next)=>{if(res.headersSent)return next(error);console.error(error);
     if(error.code==='DATABASE_URL_MISSING')return res.status(503).json({error:'Database connection is not configured for this deployment.'});
     if(error.code==='STRIPE_CONFIG_MISSING')return res.status(503).json({error:error.message});
+    if(error.code==='STRIPE_ACCOUNT_MISMATCH')return res.status(503).json({error:'Stripe account verification failed.'});
     if(error.message==='CORS origin denied')return res.status(403).json({error:error.message});
     if(error.code==='23505')return res.status(409).json({error:'Duplicate value.'});
     if(error.code==='23503')return res.status(409).json({error:'Record is referenced.'});return res.status(500).json({error:'Internal server error.'})});

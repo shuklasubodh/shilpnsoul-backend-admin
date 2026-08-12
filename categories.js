@@ -43,6 +43,17 @@ const withProductImages = async (rows) => {
   })
 }
 
+router.get('/banners', async (req, res) => {
+  const p = page(req.query)
+  const count = await sql.query('SELECT COUNT(*)::int count FROM banners WHERE is_active=true')
+  const rows = await sql.query(
+    'SELECT * FROM banners WHERE is_active=true ORDER BY sort_order, id LIMIT $1 OFFSET $2',
+    [p.limit, p.start],
+  )
+  res.set('X-Total-Count', count[0].count)
+  return res.json(rows)
+})
+
 for (const [name, columns] of Object.entries(resources)) {
   router.get(`/${name}`, async (req, res) => {
     const p = page(req.query)

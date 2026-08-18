@@ -222,8 +222,12 @@ export default async function handler(request, response) {
 
   try {
     if (resourceName === 'blob-upload' && !id && !extra.length && request.method === 'POST') {
+      if (!process.env.BLOB_READ_WRITE_TOKEN) {
+        return json(response, 503, { error: 'BLOB_READ_WRITE_TOKEN is not configured in the backend deployment.' })
+      }
       try {
         const result = await handleUpload({
+          token: process.env.BLOB_READ_WRITE_TOKEN,
           request,
           body: request.body,
           onBeforeGenerateToken: async (pathname, clientPayload) => {
@@ -233,7 +237,7 @@ export default async function handler(request, response) {
             const allowedPrefix = uploadType === 'banner' ? 'banner/' : 'products/'
             if (!String(pathname).startsWith(allowedPrefix)) throw new Error(`Uploads of this type must be stored under ${allowedPrefix}.`)
             return {
-              allowedContentTypes: ['image/avif', 'image/gif', 'image/jpeg', 'image/png', 'image/webp'],
+              allowedContentTypes: ['image/*'],
               addRandomSuffix: false,
             }
           },

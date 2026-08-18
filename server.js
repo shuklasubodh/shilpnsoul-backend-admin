@@ -6,15 +6,18 @@ import catalog from'./categories.js';
 import carts from'./carts.js';
 import orders from'./orders.js';
 import payments,{stripeWebhook}from'./payments.js';
+import adminApi from'./admin.js';
 
-const defaultOrigins='http://localhost:5173,https://shilpnsoul-react-fe.vercel.app,https://shilpnsoul.com,https://www.shilpnsoul.com';
+const defaultOrigins='http://localhost:5173,https://shilnsoul-react-admin.vercel.app,https://shilpnsoul-react-fe.vercel.app,https://shilpnsoul.com,https://www.shilpnsoul.com';
 
 const normalizeOrigin=value=>String(value||'').trim().replace(/\/$/,'');
 const app=express(),origins=[...new Set(`${defaultOrigins},${process.env.CORS_ORIGINS||''}`.split(',').map(normalizeOrigin).filter(Boolean))];
 
 app.use(cors({origin:(origin,callback)=>!origin||origins.includes(normalizeOrigin(origin))?callback(null,true):callback(new Error('CORS origin denied')),exposedHeaders:['X-Total-Count']}));
 app.use('/api/payments/stripe/webhook',stripeWebhook);
-app.use(express.json({limit:'64kb'}));
+app.use(express.json({limit:'4mb'}));
+
+app.use('/api/admin',(req,res)=>{const request=Object.create(req);Object.defineProperty(request,'query',{value:{...req.query,route:String(req.path||'').replace(/^\/+|\/+$/g,'')}});return adminApi(request,res)});
 
 app.get('/api/health',async(req,res)=>{await sql`SELECT 1`;res.json({status:'ok',database:'connected'})});
 

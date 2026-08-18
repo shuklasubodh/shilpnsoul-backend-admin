@@ -249,7 +249,7 @@ export default async function handler(request, response) {
           body: request.body,
           onBeforeGenerateToken: async (pathname, clientPayload) => {
             const { adminToken, uploadType = 'product' } = parseJson(clientPayload, {})
-            const session = jwt.verify(adminToken || '', authSecret, { issuer: 'shilpnsoul-admin' })
+            const session = jwt.verify(adminToken || '', authSecret, { algorithms: ['HS256'], issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
             if (session.role !== 'ADMIN') throw new Error('Administrator access is required.')
             const allowedPrefix = uploadType === 'banner' ? 'banner/' : 'products/'
             if (!String(pathname).startsWith(allowedPrefix)) throw new Error(`Uploads of this type must be stored under ${allowedPrefix}.`)
@@ -291,14 +291,14 @@ export default async function handler(request, response) {
         await sql.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [migratedHash, user.id])
       }
       const identity = { id: String(user.id), fullName: `${user.first_name} ${user.last_name}`.trim(), email: user.email, role: 'ADMIN' }
-      const token = jwt.sign(identity, authSecret, { expiresIn: '8h', issuer: 'shilpnsoul-admin' })
+      const token = jwt.sign(identity, authSecret, { algorithm: 'HS256', expiresIn: process.env.ADMIN_JWT_EXPIRES_IN || '8h', issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
       return json(response, 200, { token, user: identity })
     }
 
     const authorization = request.headers.authorization || ''
     const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : ''
     try {
-      const session = jwt.verify(token, authSecret, { issuer: 'shilpnsoul-admin' })
+      const session = jwt.verify(token, authSecret, { algorithms: ['HS256'], issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
       if (session.role !== 'ADMIN') return json(response, 403, { error: 'Administrator access is required.' })
     } catch {
       return json(response, 401, { error: 'Authentication is required.' })

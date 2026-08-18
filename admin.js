@@ -99,6 +99,7 @@ const publicRecord = (resourceName, record) => {
   return { ...record, image_url: images[0] || '', images }
 }
 
+
 const validBlobUrl = (value) => {
   try {
     const url = new URL(String(value))
@@ -191,7 +192,9 @@ const syncProductImageUrls = async (sql, productId) => {
 
 const databaseError = (response, error) => {
   console.error('Database request failed:', error)
-  if (error.code === '42P01' || error.code === '42703') {
+  if (error.name?.includes('Blob') || /vercel blob|blob store/i.test(String(error.message))) {
+    return json(response, 503, { error: `Vercel Blob: ${error.message || 'storage request failed'}` })
+  }  if (error.code === '42P01' || error.code === '42703') {
     return json(response, 500, { error: 'The database schema does not match this resource configuration.' })
   }
   if (error.code === '23505') return json(response, 409, { error: 'A record with that unique value already exists.' })
@@ -219,10 +222,6 @@ export default async function handler(request, response) {
 
   try {
     if (resourceName === 'blob-upload' && !id && !extra.length && request.method === 'POST') {
-      if (!process.env.BLOB_READ_WRITE_TOKEN) {
-        console.error('[blob-upload] BLOB_READ_WRITE_TOKEN is not configured')
-        return json(response, 503, { error: 'Image storage is not configured. Connect a Vercel Blob store to this project.' })
-      }
       try {
         const result = await handleUpload({
           request,
@@ -285,7 +284,6 @@ export default async function handler(request, response) {
     }
 
     if (resourceName === 'blob-images' && !id && !extra.length) {
-      if (!process.env.BLOB_READ_WRITE_TOKEN) return json(response, 503, { error: 'Connect a Vercel Blob store to manage product images.' })
       if (request.method === 'GET') {
         const result = await listBlobs({ prefix: 'products/', limit: 1000, cursor: request.query.cursor || undefined })
         return json(response, 200, result)
@@ -346,7 +344,6 @@ export default async function handler(request, response) {
     }
 
     if (resourceName === 'image-repair' && !id && !extra.length && request.method === 'POST') {
-      if (!process.env.BLOB_READ_WRITE_TOKEN) return json(response, 503, { error: 'Connect a Vercel Blob store before repairing image references.' })
       await ensureProductImagesTable(sql)
       const blobs = await allProductBlobs()
       const blobByPath = new Map(blobs.map((blob) => [blob.pathname, blob]))
@@ -426,7 +423,7 @@ export default async function handler(request, response) {
           blobResult = await getBlob(blobUrl, { access: preferredAccess === 'private' ? 'public' : 'private' })
         } catch (retryError) {
           console.error('[blob-content] Blob could not be read using public or private access:', firstError, retryError)
-          return json(response, 502, { error: 'The configured Blob token cannot read this image. Confirm this project is connected to the Blob store containing the listed files.' })
+          return json(response, 502, { error: 'The configured Blob credentials cannot read this image. Confirm this project is connected to the Blob store containing the listed files.' })
         }
       }
       if (!blobResult) return json(response, 404, { error: 'Blob image not found.' })

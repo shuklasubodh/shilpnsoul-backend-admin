@@ -3,7 +3,7 @@ import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { handleUpload } from '@vercel/blob/client'
-import { del as deleteBlob, get as getBlob, list as listBlobs } from '@vercel/blob'
+import { del as deleteBlob, get as getBlob, list as listBlobs, rename as renameBlob } from '@vercel/blob'
 
 const BCRYPT_ROUNDS = 12
 const bcryptHashPattern = /^\$2[aby]\$\d{2}\$.{53}$/
@@ -104,6 +104,23 @@ const validBlobUrl = (value) => {
     const url = new URL(String(value))
     return url.protocol === 'https:' && url.hostname.endsWith('.blob.vercel-storage.com')
   } catch { return false }
+}
+
+const blobFileName = (blobUrl, blobPathname = '') => {
+  const pathname = String(blobPathname || decodeURIComponent(new URL(String(blobUrl)).pathname)).replace(/^\/+/, '')
+  return pathname.split('/').filter(Boolean).at(-1)
+}
+
+const moveBlobToFolder = async (blobUrl, blobPathname, folder) => {
+  const fileName = blobFileName(blobUrl, blobPathname)
+  if (!fileName) throw new Error('The Blob pathname does not contain a filename.')
+  const targetPathname = `products/${folder}/${fileName}`
+  const sourcePathname = String(blobPathname || decodeURIComponent(new URL(String(blobUrl)).pathname)).replace(/^\/+/, '')
+  if (sourcePathname === targetPathname) return { url: String(blobUrl), pathname: targetPathname }
+  const moved = await renameBlob(String(blobUrl), targetPathname, {
+    access: 'public', addRandomSuffix: false, allowOverwrite: true,
+  })
+  return { url: moved.url, pathname: moved.pathname }
 }
 
 const ensureProductImagesTable = async (sql) => {
@@ -452,8 +469,13 @@ export default async function handler(request, response) {
       if (request.method === 'POST' && !id) {
         const { product_id: productId, blob_url: blobUrl, blob_pathname: blobPathname = '', sort_order: sortOrder = 0, is_primary: isPrimary = false } = request.body || {}
         if (!positiveId(productId) || !validBlobUrl(blobUrl)) return json(response, 400, { error: 'A valid product and public Vercel Blob URL are required.' })
-        const products = await sql.query('SELECT id FROM products WHERE id = $1', [productId])
+        const products = await sql.query('SELECT id, slug FROM products WHERE id = $1', [productId])
         if (!products.length) return json(response, 404, { error: 'Product not found.' })
+        const movedBlob = await moveBlobToFolder(blobUrl, blobPathname, products[0].slug)
+        const previousMappings = await sql.query(
+          'DELETE FROM product_images WHERE blob_url = $1 OR ($2 <> \'\' AND blob_pathname = $2) RETURNING product_id',
+          [String(blobUrl), String(blobPathname)],
+        )
         if (isPrimary) await sql.query('UPDATE product_images SET is_primary = FALSE, updated_at = NOW() WHERE product_id = $1', [productId])
         const rows = await sql.query(`
           INSERT INTO product_images (product_id, blob_url, blob_pathname, sort_order, is_primary)
@@ -464,15 +486,24 @@ export default async function handler(request, response) {
             is_primary = EXCLUDED.is_primary,
             updated_at = NOW()
           RETURNING *
-        `, [productId, String(blobUrl), String(blobPathname), Math.max(0, Math.floor(Number(sortOrder) || 0)), Boolean(isPrimary)])
+        `, [productId, movedBlob.url, movedBlob.pathname, Math.max(0, Math.floor(Number(sortOrder) || 0)), Boolean(isPrimary)])
+        for (const previousProductId of new Set(previousMappings.map((mapping) => mapping.product_id))) {
+          if (Number(previousProductId) !== Number(productId)) await syncProductImageUrls(sql, previousProductId)
+        }
         await syncProductImageUrls(sql, productId)
         return json(response, 200, rows[0])
       }
       if (request.method === 'DELETE' && id && positiveId(id)) {
-        const rows = await sql.query('DELETE FROM product_images WHERE id = $1 RETURNING id, product_id', [id])
+        const existingRows = await sql.query('SELECT id, product_id, blob_url, blob_pathname FROM product_images WHERE id = $1', [id])
+        if (!existingRows.length) return json(response, 404, { error: 'Image mapping not found.' })
+        const movedBlob = await moveBlobToFolder(existingRows[0].blob_url, existingRows[0].blob_pathname, 'unmapped')
+        const rows = await sql.query(
+          'DELETE FROM product_images WHERE blob_url = $1 OR (blob_pathname <> \'\' AND blob_pathname = $2) RETURNING id, product_id',
+          [existingRows[0].blob_url, existingRows[0].blob_pathname],
+        )
         if (!rows.length) return json(response, 404, { error: 'Image mapping not found.' })
-        await syncProductImageUrls(sql, rows[0].product_id)
-        return json(response, 200, rows[0])
+        for (const affectedProductId of new Set(rows.map((mapping) => mapping.product_id))) await syncProductImageUrls(sql, affectedProductId)
+        return json(response, 200, { ...rows[0], blob_url: movedBlob.url, blob_pathname: movedBlob.pathname })
       }
       return json(response, 405, { error: 'Method not allowed.' })
     }

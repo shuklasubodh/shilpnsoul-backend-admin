@@ -312,7 +312,13 @@ export default async function handler(request, response) {
       if (request.method === 'DELETE') {
         const blobUrl = request.body?.blob_url
         if (!validBlobUrl(blobUrl)) return json(response, 400, { error: 'A valid Vercel Blob URL is required.' })
-        await deleteBlob(String(blobUrl))
+        let blobAlreadyMissing = false
+        try {
+          await deleteBlob(String(blobUrl))
+        } catch (deleteError) {
+          if (deleteError?.name === 'BlobNotFoundError' || /requested blob does not exist/i.test(String(deleteError?.message))) blobAlreadyMissing = true
+          else throw deleteError
+        }
         await ensureProductImagesTable(sql)
         const removedMappings = await sql.query('DELETE FROM product_images WHERE blob_url = $1 RETURNING id', [String(blobUrl)])
         const affectedProducts = await sql.query('SELECT id, image_url FROM products WHERE image_url LIKE $1', [`%${String(blobUrl)}%`])
@@ -322,7 +328,7 @@ export default async function handler(request, response) {
           await sql.query('UPDATE products SET image_url = $1, updated_at = NOW() WHERE id = $2', [JSON.stringify(remainingImages), product.id])
           updatedProducts += 1
         }
-        return json(response, 200, { deleted: true, removed_mappings: removedMappings.length, updated_products: updatedProducts })
+        return json(response, 200, { deleted: !blobAlreadyMissing, blob_already_missing: blobAlreadyMissing, removed_mappings: removedMappings.length, updated_products: updatedProducts })
       }
       return json(response, 405, { error: 'Method not allowed.' })
     }

@@ -34,7 +34,48 @@ router.post('/orders',async(req,res)=>{
 
 router.get('/orders',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELECT * FROM orders ORDER BY id DESC`:await sql`SELECT * FROM orders WHERE user_id=${req.user.id} ORDER BY id DESC`;res.set('X-Total-Count',rows.length);return res.json(rows)});
 router.get('/orders/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&String(order.user_id)!==String(req.user.id))return notFound(res,'Order');order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;return res.json(order)});
-router.put('/orders/:id',admin,async(req,res)=>{const status=String(req.body.status||'').toUpperCase();if(!['PENDING','CONFIRMED','PROCESSING','SHIPPED','DELIVERED','CANCELLED'].includes(status))return res.status(400).json({error:'Invalid status.'});const rows=await sql`UPDATE orders SET status=${status},updated_at=NOW() WHERE id=${req.params.id} RETURNING *`;return rows[0]?res.json(rows[0]):notFound(res,'Order')});
+router.put('/orders/:id',admin,async(req,res)=>{
+  const status=String(req.body.status||'').toUpperCase();
+  if(!['PENDING','CONFIRMED','PROCESSING','SHIPPED','DELIVERED','CANCELLED'].includes(status))return res.status(400).json({error:'Invalid status.'});
+
+  const current=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];
+  if(!current)return notFound(res,'Order');
+  if(current.status==='CANCELLED'){
+    if(status==='CANCELLED')return res.json(current);
+    return res.status(409).json({error:'Cancelled orders cannot be reopened.'});
+  }
+
+  if(status==='CANCELLED'){
+    const rows=await sql`
+      WITH cancelled_order AS (
+        UPDATE orders
+        SET status='CANCELLED',updated_at=NOW()
+        WHERE id=${req.params.id} AND status<>'CANCELLED'
+        RETURNING *
+      ), item_quantities AS (
+        SELECT oi.product_id,SUM(oi.quantity)::integer AS quantity
+        FROM order_items oi
+        JOIN cancelled_order co ON co.id=oi.order_id
+        GROUP BY oi.product_id
+      ), restored_products AS (
+        UPDATE products p
+        SET stock_quantity=p.stock_quantity+iq.quantity,updated_at=NOW()
+        FROM item_quantities iq
+        WHERE p.id=iq.product_id
+        RETURNING p.id
+      )
+      SELECT * FROM cancelled_order
+    `;
+    if(rows[0])return res.json(rows[0]);
+
+    const latest=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];
+    return latest?res.json(latest):notFound(res,'Order');
+  }
+
+  const rows=await sql`UPDATE orders SET status=${status},updated_at=NOW() WHERE id=${req.params.id} AND status<>'CANCELLED' RETURNING *`;
+  if(rows[0])return res.json(rows[0]);
+  return res.status(409).json({error:'Cancelled orders cannot be reopened.'});
+});
 router.get('/order-items/order/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&String(order.user_id)!==String(req.user.id))return res.status(403).json({error:'Access denied.'});return res.json(await sql`SELECT * FROM order_items WHERE order_id=${req.params.id}`)});
 
 export default router;

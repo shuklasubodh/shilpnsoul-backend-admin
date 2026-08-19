@@ -24,6 +24,7 @@ router.post('/orders',async(req,res)=>{
   }
   const number=`ORD-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
   const order=(await sql`INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,payment_method,payment_status) VALUES(${req.user.id},${number},'PENDING',${shipping_name},${shipping_phone},${shipping_address},${total.toFixed(2)},${req.body.contact_email||req.user.email},${req.body.contact_phone||req.user.phone||shipping_phone},${paymentMethod},'UNPAID') RETURNING *`)[0];
+  await sql`INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id) VALUES(${order.id},'ORDER_CREATED','PENDING','UNPAID','CUSTOMER',${req.user.id})`;
   for(const item of prepared){
     await sql`INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price,subtotal) VALUES(${order.id},${item.product.id},${item.product.name},${item.quantity},${item.product.price},${item.subtotal.toFixed(2)})`;
     await sql`UPDATE products SET stock_quantity=stock_quantity-${item.quantity},updated_at=NOW() WHERE id=${item.product.id}`;
@@ -32,11 +33,11 @@ router.post('/orders',async(req,res)=>{
   return res.status(201).json(order);
 });
 
-router.get('/orders',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELECT * FROM orders ORDER BY id DESC`:await sql`SELECT * FROM orders WHERE user_id=${req.user.id} ORDER BY id DESC`;res.set('X-Total-Count',rows.length);return res.json(rows)});
-router.get('/orders/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&String(order.user_id)!==String(req.user.id))return notFound(res,'Order');order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;return res.json(order)});
+router.get('/orders',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELECT * FROM orders ORDER BY id DESC`:await sql`SELECT * FROM orders WHERE user_id=${req.user.id} AND customer_hidden_at IS NULL ORDER BY id DESC`;res.set('X-Total-Count',rows.length);return res.json(rows)});
+router.get('/orders/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&(String(order.user_id)!==String(req.user.id)||order.customer_hidden_at))return notFound(res,'Order');order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;return res.json(order)});
 router.put('/orders/:id',admin,async(req,res)=>{
   const status=String(req.body.status||'').toUpperCase();
-  if(!['PENDING','CONFIRMED','PROCESSING','SHIPPED','DELIVERED','CANCELLED'].includes(status))return res.status(400).json({error:'Invalid status.'});
+  if(!['PENDING','CONFIRMED','PROCESSING','SHIPPED','DELIVERED','CANCELLED','RETURNED'].includes(status))return res.status(400).json({error:'Invalid status.'});
 
   const current=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];
   if(!current)return notFound(res,'Order');
@@ -44,6 +45,7 @@ router.put('/orders/:id',admin,async(req,res)=>{
     if(status==='CANCELLED')return res.json(current);
     return res.status(409).json({error:'Cancelled orders cannot be reopened.'});
   }
+  if(current.status===status)return res.json(current);
 
   if(status==='CANCELLED'){
     const rows=await sql`
@@ -64,17 +66,40 @@ router.put('/orders/:id',admin,async(req,res)=>{
         WHERE p.id=iq.product_id
         RETURNING p.id
       )
-      SELECT * FROM cancelled_order
+      INSERT INTO order_events(order_id,event_type,from_status,to_status,actor_type,actor_id)
+      SELECT id,'STATUS_CHANGED',${current.status},'CANCELLED','ADMIN',${req.user.id} FROM cancelled_order
+      RETURNING (SELECT row_to_json(co) FROM cancelled_order co) AS order
     `;
-    if(rows[0])return res.json(rows[0]);
+    if(rows[0]?.order)return res.json(rows[0].order);
 
     const latest=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];
     return latest?res.json(latest):notFound(res,'Order');
   }
 
-  const rows=await sql`UPDATE orders SET status=${status},updated_at=NOW() WHERE id=${req.params.id} AND status<>'CANCELLED' RETURNING *`;
-  if(rows[0])return res.json(rows[0]);
+  const rows=await sql`WITH changed AS (UPDATE orders SET status=${status},updated_at=NOW() WHERE id=${req.params.id} AND status<>'CANCELLED' RETURNING *) INSERT INTO order_events(order_id,event_type,from_status,to_status,actor_type,actor_id) SELECT id,'STATUS_CHANGED',${current.status},${status},'ADMIN',${req.user.id} FROM changed RETURNING (SELECT row_to_json(c) FROM changed c) AS order`;
+  if(rows[0]?.order)return res.json(rows[0].order);
   return res.status(409).json({error:'Cancelled orders cannot be reopened.'});
+});
+router.delete('/orders/:id',async(req,res)=>{
+  const rows=await sql`
+    WITH hidden AS (
+      UPDATE orders SET customer_hidden_at=NOW(),updated_at=NOW()
+      WHERE id=${req.params.id} AND user_id=${req.user.id} AND customer_hidden_at IS NULL
+        AND (payment_status='PAID' OR status IN ('CANCELLED','RETURNED'))
+      RETURNING id
+    )
+    INSERT INTO order_events(order_id,event_type,actor_type,actor_id)
+    SELECT id,'HIDDEN_BY_CUSTOMER','CUSTOMER',${req.user.id} FROM hidden
+    RETURNING order_id
+  `;
+  if(rows[0])return res.status(204).end();
+  const order=(await sql`SELECT id FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
+  return order?res.status(409).json({error:'Only paid, cancelled, or returned orders can be removed from order history.'}):notFound(res,'Order');
+});
+router.get('/orders/:id/history',async(req,res)=>{
+  const order=(await sql`SELECT id,user_id,customer_hidden_at FROM orders WHERE id=${req.params.id}`)[0];
+  if(!order||!isAdmin(req.user)&&(String(order.user_id)!==String(req.user.id)||order.customer_hidden_at))return notFound(res,'Order');
+  return res.json(await sql`SELECT id,event_type,from_status,to_status,from_payment_status,to_payment_status,actor_type,created_at FROM order_events WHERE order_id=${order.id} ORDER BY created_at,id`);
 });
 router.get('/order-items/order/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&String(order.user_id)!==String(req.user.id))return res.status(403).json({error:'Access denied.'});return res.json(await sql`SELECT * FROM order_items WHERE order_id=${req.params.id}`)});
 

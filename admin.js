@@ -33,7 +33,7 @@ const resources = {
   orders: {
     table: 'orders',
     columns: ['order_number', 'user_id', 'status', 'total_amount', 'shipping_address', 'payment_status'],
-    publicColumns: ['id', 'order_number', 'user_id', 'status', 'total_amount', 'shipping_address', 'payment_status', 'created_at', 'updated_at'],
+    publicColumns: ['id', 'order_number', 'user_id', 'status', 'total_amount', 'shipping_address', 'payment_status', 'customer_hidden_at', 'archived_at', 'created_at', 'updated_at'],
     searchColumns: ['order_number', 'status', 'shipping_address', 'payment_status'],
     responseKey: 'order',
   },
@@ -41,6 +41,12 @@ const resources = {
 
 const json = (response, status, body) => response.status(status).json(body)
 const positiveId = (value) => /^\d+$/.test(String(value)) && Number(value) > 0
+const retentionDays = (value) => Math.min(3650, Math.max(1, Number.parseInt(value, 10) || 30))
+const csvCell = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`
+const orderArchiveWhere = `
+  (o.payment_status = 'PAID' OR o.status IN ('CANCELLED', 'RETURNED'))
+  AND o.updated_at <= NOW() - ($1::int * INTERVAL '1 day')
+`
 const slugify = (value) => String(value ?? '')
   .trim()
   .toLowerCase()
@@ -297,11 +303,50 @@ export default async function handler(request, response) {
 
     const authorization = request.headers.authorization || ''
     const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : ''
+    let adminSession
     try {
-      const session = jwt.verify(token, authSecret, { algorithms: ['HS256'], issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
-      if (session.role !== 'ADMIN') return json(response, 403, { error: 'Administrator access is required.' })
+      adminSession = jwt.verify(token, authSecret, { algorithms: ['HS256'], issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
+      if (adminSession.role !== 'ADMIN') return json(response, 403, { error: 'Administrator access is required.' })
     } catch {
       return json(response, 401, { error: 'Authentication is required.' })
+    }
+
+    if (resourceName === 'order-archive' && id === 'eligible' && !extra.length && request.method === 'GET') {
+      const days = retentionDays(request.query.retention_days)
+      const rows = await sql.query(`SELECT COUNT(*)::int AS count FROM orders o WHERE ${orderArchiveWhere} AND o.archived_at IS NULL`, [days])
+      return json(response, 200, { retention_days: days, eligible_count: rows[0].count })
+    }
+
+    if (resourceName === 'order-archive' && id === 'archive' && !extra.length && request.method === 'POST') {
+      const days = retentionDays(request.body?.retention_days)
+      const rows = await sql.query(`
+        WITH archived AS (
+          UPDATE orders o SET archived_at = NOW(), updated_at = NOW()
+          WHERE ${orderArchiveWhere} AND o.archived_at IS NULL
+          RETURNING o.id
+        )
+        INSERT INTO order_events(order_id,event_type,actor_type,actor_id,metadata)
+        SELECT id,'ARCHIVED','ADMIN',$2,jsonb_build_object('retention_days',$1) FROM archived
+        RETURNING order_id
+      `, [days, adminSession.id])
+      return json(response, 200, { retention_days: days, archived_count: rows.length })
+    }
+
+    if (resourceName === 'order-archive' && id === 'export' && !extra.length && request.method === 'GET') {
+      const rows = await sql.query(`
+        SELECT o.id,o.order_number,o.user_id,o.status,o.payment_status,o.payment_method,o.total_amount,
+          o.shipping_name,o.shipping_phone,o.shipping_address,o.contact_email,o.contact_phone,
+          o.customer_hidden_at,o.archived_at,o.created_at,o.updated_at,
+          COALESCE(string_agg(oi.product_name || ' x' || oi.quantity, ' | ' ORDER BY oi.id),'') AS items
+        FROM orders o LEFT JOIN order_items oi ON oi.order_id=o.id
+        WHERE o.archived_at IS NOT NULL
+        GROUP BY o.id ORDER BY o.archived_at,o.id
+      `)
+      const columns = ['id','order_number','user_id','status','payment_status','payment_method','total_amount','items','shipping_name','shipping_phone','shipping_address','contact_email','contact_phone','customer_hidden_at','archived_at','created_at','updated_at']
+      const csv = [columns.map(csvCell).join(','), ...rows.map((row) => columns.map((column) => csvCell(row[column])).join(','))].join('\r\n')
+      response.setHeader('Content-Type', 'text/csv; charset=utf-8')
+      response.setHeader('Content-Disposition', `attachment; filename="order-archive-${new Date().toISOString().slice(0, 10)}.csv"`)
+      return response.status(200).send(`\uFEFF${csv}`)
     }
 
     if (resourceName === 'blob-images' && !id && !extra.length) {
@@ -691,6 +736,32 @@ export default async function handler(request, response) {
 
     if (request.method === 'PUT' && id) {
       const body = request.body || {}
+      if (resourceName === 'orders' && body.status !== undefined) {
+        const status = String(body.status).toUpperCase()
+        const allowed = ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED']
+        if (!allowed.includes(status)) return json(response, 400, { error: 'Invalid order status.' })
+        const currentRows = await sql.query('SELECT * FROM orders WHERE id = $1', [id])
+        if (!currentRows.length) return json(response, 404, { error: 'Record not found.' })
+        const current = currentRows[0]
+        if (current.status === status) return json(response, 200, { message: 'Order status is unchanged.', order: current })
+        if (current.status === 'CANCELLED') return json(response, 409, { error: 'Cancelled orders cannot be reopened.' })
+        const rows = await sql.query(`
+          WITH changed AS (
+            UPDATE orders SET status=$1,updated_at=NOW() WHERE id=$2 AND status<>'CANCELLED' RETURNING *
+          ), quantities AS (
+            SELECT oi.product_id,SUM(oi.quantity)::integer AS quantity FROM order_items oi JOIN changed c ON c.id=oi.order_id
+            WHERE $1='CANCELLED' GROUP BY oi.product_id
+          ), restored AS (
+            UPDATE products p SET stock_quantity=p.stock_quantity+q.quantity,updated_at=NOW()
+            FROM quantities q WHERE p.id=q.product_id RETURNING p.id
+          )
+          INSERT INTO order_events(order_id,event_type,from_status,to_status,actor_type,actor_id)
+          SELECT id,'STATUS_CHANGED',$3,$1,'ADMIN',$4 FROM changed
+          RETURNING (SELECT row_to_json(c) FROM changed c) AS order
+        `, [status, id, current.status, adminSession.id])
+        if (!rows[0]?.order) return json(response, 409, { error: 'Order status changed during this request. Refresh and try again.' })
+        return json(response, 200, { message: 'Order updated successfully.', order: rows[0].order })
+      }
       const columns = resource.columns.filter((column) => availableColumns.includes(column) && body[column] !== undefined && body[column] !== '')
       if (!columns.length) return json(response, 400, { error: 'At least one valid field is required.' })
       const values = await prepareValues(resourceName, columns, body)
@@ -706,6 +777,7 @@ export default async function handler(request, response) {
     }
 
     if (request.method === 'DELETE' && id) {
+      if (resourceName === 'orders') return json(response, 409, { error: 'Orders are retained for audit and cannot be deleted by administrators.' })
       if (['products', 'categories'].includes(resourceName) && availableColumns.includes('is_active')) {
         const updatedAt = availableColumns.includes('updated_at') ? ', "updated_at" = NOW()' : ''
         const rows = await sql.query(`UPDATE "${resource.table}" SET "is_active" = FALSE${updatedAt} WHERE id = $1 RETURNING id`, [id])

@@ -1,7 +1,7 @@
 import {Router,raw} from 'express';
 import Stripe from 'stripe';
 import sql from './db.js';
-import {authenticate,admin} from './auth.js';
+import {admin,optionalAuthenticate,verifyOrderAccessToken} from './auth.js';
 import {isId,notFound} from './utils.js';
 
 let client;
@@ -58,11 +58,15 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
 });
 
 const router=Router();
-router.use(authenticate);
+router.use(optionalAuthenticate);
+const canAccessOrder=(req,order)=>{
+  if(req.user&&String(order.user_id)===String(req.user.id))return true;
+  try{const claims=verifyOrderAccessToken(req.get('x-order-access-token'));return claims.type==='guest-order'&&String(claims.sub)===String(order.id)&&claims.destination===order.notification_destination}catch{return false}
+};
 router.post('/orders/:id/checkout',async(req,res)=>{
   if(!isId(req.params.id))return notFound(res,'Order');
-  const order=(await sql`SELECT id,user_id,order_number,total_amount,contact_email,payment_method,payment_status,status FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
-  if(!order)return notFound(res,'Order');
+  const order=(await sql`SELECT id,user_id,order_number,total_amount,contact_email,notification_destination,payment_method,payment_status,status FROM orders WHERE id=${req.params.id}`)[0];
+  if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
   if(order.payment_status==='PAID')return res.status(409).json({error:'Order is already paid.'});
   if(order.status==='CANCELLED')return res.status(409).json({error:'Cancelled orders cannot be paid.'});
   const successUrl=process.env.PAYMENT_SUCCESS_URL,cancelUrl=process.env.PAYMENT_CANCEL_URL;
@@ -80,19 +84,19 @@ router.post('/orders/:id/checkout',async(req,res)=>{
     payment_method_types:['card','paynow'],
     customer_email:order.contact_email||req.user.email,
     client_reference_id:String(order.id),
-    metadata:{order_id:String(order.id),order_number:order.order_number,user_id:String(req.user.id)},
+    metadata:{order_id:String(order.id),order_number:order.order_number,user_id:String(req.user?.id||'guest')},
     line_items:[{quantity:1,price_data:{currency:currency(),unit_amount:minorUnits(order.total_amount),product_data:{name:`Order ${order.order_number}`}}}],
     success_url:successUrl,
     cancel_url:cancelUrl,
   },{idempotencyKey:`order-${order.id}-checkout-${attempts+1}`});
-  await sql`INSERT INTO payments(order_id,user_id,provider,method,status,amount,currency,stripe_checkout_session_id) VALUES(${order.id},${req.user.id},'STRIPE','ONLINE','PENDING',${order.total_amount},${currency().toUpperCase()},${session.id}) ON CONFLICT(stripe_checkout_session_id) DO NOTHING`;
+  await sql`INSERT INTO payments(order_id,user_id,provider,method,status,amount,currency,stripe_checkout_session_id) VALUES(${order.id},${req.user?.id||null},'STRIPE','ONLINE','PENDING',${order.total_amount},${currency().toUpperCase()},${session.id}) ON CONFLICT(stripe_checkout_session_id) DO NOTHING`;
   await sql`UPDATE orders SET payment_method='STRIPE',updated_at=NOW() WHERE id=${order.id}`;
   return res.status(201).json({checkout_url:session.url,session_id:session.id});
 });
 
 router.get('/orders/:id/payment',async(req,res)=>{
-  const order=(await sql`SELECT id,user_id,payment_method,payment_status FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
-  if(!order)return notFound(res,'Order');
+  const order=(await sql`SELECT id,user_id,notification_destination,payment_method,payment_status FROM orders WHERE id=${req.params.id}`)[0];
+  if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
   const payment=(await sql`SELECT provider,method,status,amount,currency,paid_at,created_at,updated_at FROM payments WHERE order_id=${order.id} ORDER BY id DESC LIMIT 1`)[0]||null;
   return res.json({order_id:order.id,payment_method:order.payment_method,payment_status:order.payment_status,payment});
 });

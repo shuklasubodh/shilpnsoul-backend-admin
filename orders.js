@@ -1,18 +1,32 @@
 import {Router} from 'express';
 import crypto from 'node:crypto';
 import sql from './db.js';
-import {authenticate,admin,isAdmin} from './auth.js';
+import {authenticate,admin,isAdmin,orderAccessTokenFor,verifyNotificationToken,verifyOrderAccessToken} from './auth.js';
+import {sendOrderSummary} from './email.js';
 import {notFound} from './utils.js';
 
 const router=Router();
-router.use(authenticate);
 
-router.post('/orders',async(req,res)=>{
+const verifiedNotification=async(req,user)=>{
+  const channel=String(req.body.notification_channel||'').toUpperCase(),destination=String(req.body.notification_destination||req.body.contact_email||'').trim().toLowerCase();
+  if(channel!=='EMAIL')throw Object.assign(new Error(channel==='WHATSAPP'?'WhatsApp notifications are not configured yet.':'Select and confirm an email notification channel.'),{status:channel==='WHATSAPP'?503:400});
+  if(user?.email_verified_at&&destination===String(user.email).toLowerCase())return{channel,destination};
+  let claims;
+  try{claims=verifyNotificationToken(req.body.notification_verification_token)}catch{throw Object.assign(new Error('Verify the selected email before placing the order.'),{status:403})}
+  if(claims.type!=='notification-verification'||claims.purpose!=='CHECKOUT'||claims.channel!==channel||claims.destination!==destination)throw Object.assign(new Error('The notification verification does not match this order.'),{status:403});
+  const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${claims.verification_id} AND verified_at IS NOT NULL`)[0];
+  if(!challenge)throw Object.assign(new Error('Notification verification is incomplete.'),{status:403});
+  return{channel,destination};
+};
+
+const createOrder=async(req,res,user=null)=>{
   const {shipping_name,shipping_phone,shipping_address}=req.body;
   const items=req.body.items;
   const paymentMethod=String(req.body.payment_method||'CASH').toUpperCase();
   if(!['CASH','STRIPE'].includes(paymentMethod))return res.status(400).json({error:'Payment method must be CASH or STRIPE.'});
   if(!shipping_name||!shipping_phone||!shipping_address||!Array.isArray(items)||!items.length)return res.status(400).json({error:'Shipping and items required.'});
+  let notification;
+  try{notification=await verifiedNotification(req,user)}catch(error){return res.status(error.status||400).json({error:error.message})}
   const prepared=[];
   let total=0;
   for(const item of items){
@@ -23,15 +37,46 @@ router.post('/orders',async(req,res)=>{
     total+=Number(product.price)*quantity;
   }
   const number=`ORD-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
-  const order=(await sql`INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,payment_method,payment_status) VALUES(${req.user.id},${number},'PENDING',${shipping_name},${shipping_phone},${shipping_address},${total.toFixed(2)},${req.body.contact_email||req.user.email},${req.body.contact_phone||req.user.phone||shipping_phone},${paymentMethod},'UNPAID') RETURNING *`)[0];
-  await sql`INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id) VALUES(${order.id},'ORDER_CREATED','PENDING','UNPAID','CUSTOMER',${req.user.id})`;
+  const order=(await sql`INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,payment_method,payment_status,notification_channel,notification_destination) VALUES(${user?.id||null},${number},'PENDING',${shipping_name},${shipping_phone},${shipping_address},${total.toFixed(2)},${req.body.contact_email||user?.email||notification.destination},${req.body.contact_phone||user?.phone||shipping_phone},${paymentMethod},'UNPAID',${notification.channel},${notification.destination}) RETURNING *`)[0];
+  await sql`INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id) VALUES(${order.id},'ORDER_CREATED','PENDING','UNPAID',${user?'CUSTOMER':'GUEST'},${user?.id||null})`;
   for(const item of prepared){
     await sql`INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price,subtotal) VALUES(${order.id},${item.product.id},${item.product.name},${item.quantity},${item.product.price},${item.subtotal.toFixed(2)})`;
     await sql`UPDATE products SET stock_quantity=stock_quantity-${item.quantity},updated_at=NOW() WHERE id=${item.product.id}`;
   }
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
+  order.notification=await sendOrderSummary(order);
+  if(!user)order.order_access_token=orderAccessTokenFor(order);
   return res.status(201).json(order);
+};
+
+const resendOrderSummary=async(res,order)=>{
+  const recent=await sql`SELECT created_at FROM notification_deliveries WHERE order_id=${order.id} AND notification_type='ORDER_SUMMARY' AND created_at>NOW()-INTERVAL '1 hour' ORDER BY created_at DESC`;
+  if(recent.length>=3)return res.status(429).json({error:'Order summary resend limit reached. Try again in one hour.'});
+  if(recent[0]&&Date.now()-new Date(recent[0].created_at).getTime()<60000)return res.status(429).json({error:'Please wait before resending the order summary.'});
+  order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
+  const notification=await sendOrderSummary(order,{resend:true});
+  return notification.status==='ACCEPTED'?res.json(notification):res.status(503).json({error:'The order summary could not be sent. Please try again.'});
+};
+
+router.post('/orders/guest',(req,res)=>createOrder(req,res));
+router.post('/orders/track',async(req,res)=>{
+  const orderNumber=String(req.body.orderNumber||req.body.order_number||'').trim(),email=String(req.body.email||'').trim().toLowerCase();
+  const order=(await sql`SELECT * FROM orders WHERE order_number=${orderNumber} AND LOWER(contact_email)=${email} AND user_id IS NULL`)[0];
+  if(!order)return res.status(404).json({error:'Guest order not found.'});
+  order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
+  order.order_access_token=orderAccessTokenFor(order);
+  return res.json(order);
 });
+router.post('/orders/:id/guest-notifications/resend',async(req,res)=>{
+  let access;
+  try{access=verifyOrderAccessToken(req.get('x-order-access-token'))}catch{return res.status(403).json({error:'Guest order access has expired.'})}
+  const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id IS NULL`)[0];
+  if(!order||access.type!=='guest-order'||String(access.sub)!==String(order.id)||access.destination!==order.notification_destination)return notFound(res,'Order');
+  return resendOrderSummary(res,order);
+});
+
+router.use(authenticate);
+router.post('/orders',(req,res)=>createOrder(req,res,req.user));
 
 router.get('/orders',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELECT * FROM orders ORDER BY id DESC`:await sql`SELECT * FROM orders WHERE user_id=${req.user.id} AND customer_hidden_at IS NULL ORDER BY id DESC`;res.set('X-Total-Count',rows.length);return res.json(rows)});
 router.get('/orders/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&(String(order.user_id)!==String(req.user.id)||order.customer_hidden_at))return notFound(res,'Order');order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;return res.json(order)});
@@ -100,6 +145,11 @@ router.get('/orders/:id/history',async(req,res)=>{
   const order=(await sql`SELECT id,user_id,customer_hidden_at FROM orders WHERE id=${req.params.id}`)[0];
   if(!order||!isAdmin(req.user)&&(String(order.user_id)!==String(req.user.id)||order.customer_hidden_at))return notFound(res,'Order');
   return res.json(await sql`SELECT id,event_type,from_status,to_status,from_payment_status,to_payment_status,actor_type,created_at FROM order_events WHERE order_id=${order.id} ORDER BY created_at,id`);
+});
+router.post('/orders/:id/notifications/resend',async(req,res)=>{
+  const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
+  if(!order)return notFound(res,'Order');
+  return resendOrderSummary(res,order);
 });
 router.get('/order-items/order/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&String(order.user_id)!==String(req.user.id))return res.status(403).json({error:'Access denied.'});return res.json(await sql`SELECT * FROM order_items WHERE order_id=${req.params.id}`)});
 

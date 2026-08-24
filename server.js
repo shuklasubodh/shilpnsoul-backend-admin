@@ -6,6 +6,7 @@ import catalog from'./categories.js';
 import carts from'./carts.js';
 import orders from'./orders.js';
 import payments,{stripeWebhook}from'./payments.js';
+import notifications from'./notifications.js';
 import adminApi from'./admin.js';
 
 const defaultOrigins='http://localhost:5173,https://shilnsoul-react-admin.vercel.app,https://shilpnsoul-react-fe.vercel.app,https://shilpnsoul.com,https://www.shilpnsoul.com';
@@ -22,6 +23,7 @@ app.use('/api/admin',(req,res)=>{const request=Object.create(req);Object.defineP
 app.get('/api/health',async(req,res)=>{await sql`SELECT 1`;res.json({status:'ok',database:'connected'})});
 
 app.use('/api',login);
+app.use('/api',notifications);
 app.use('/api/users',users);
 app.use('/api',catalog);
 app.use('/api',carts);

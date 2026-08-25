@@ -749,11 +749,16 @@ export default async function handler(request, response) {
           WITH changed AS (
             UPDATE orders SET status=$1,updated_at=NOW() WHERE id=$2 AND status<>'CANCELLED' RETURNING *
           ), quantities AS (
-            SELECT oi.product_id,SUM(oi.quantity)::integer AS quantity FROM order_items oi JOIN changed c ON c.id=oi.order_id
-            WHERE $1='CANCELLED' GROUP BY oi.product_id
+            SELECT oi.product_color_id,SUM(oi.quantity)::integer AS quantity FROM order_items oi JOIN changed c ON c.id=oi.order_id
+            WHERE $1='CANCELLED' AND oi.product_color_id IS NOT NULL GROUP BY oi.product_color_id
           ), restored AS (
-            UPDATE products p SET stock_quantity=p.stock_quantity+q.quantity,updated_at=NOW()
-            FROM quantities q WHERE p.id=q.product_id RETURNING p.id
+            UPDATE product_color p SET quantity=p.quantity+q.quantity,updated_at=NOW()
+            FROM quantities q WHERE p.id=q.product_color_id RETURNING p.id
+          ), legacy_quantities AS (
+            SELECT oi.product_id,SUM(oi.quantity)::integer quantity FROM order_items oi JOIN changed c ON c.id=oi.order_id
+            WHERE $1='CANCELLED' AND oi.product_color_id IS NULL GROUP BY oi.product_id
+          ), restored_legacy AS (
+            UPDATE products p SET stock_quantity=p.stock_quantity+q.quantity,updated_at=NOW() FROM legacy_quantities q WHERE p.id=q.product_id RETURNING p.id
           )
           INSERT INTO order_events(order_id,event_type,from_status,to_status,actor_type,actor_id)
           SELECT id,'STATUS_CHANGED',$3,$1,'ADMIN',$4 FROM changed

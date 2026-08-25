@@ -27,22 +27,45 @@ const createOrder=async(req,res,user=null)=>{
   if(!shipping_name||!shipping_phone||!shipping_address||!Array.isArray(items)||!items.length)return res.status(400).json({error:'Shipping and items required.'});
   let notification;
   try{notification=await verifiedNotification(req,user)}catch(error){return res.status(error.status||400).json({error:error.message})}
-  const prepared=[];
+  const requested=new Map();
   let total=0;
   for(const item of items){
-    const product=(await sql`SELECT * FROM products WHERE id=${item.product_id} AND is_active=true`)[0];
+    const product=(await sql`SELECT p.*,pc.id product_color_id,pc.color,pc.quantity color_quantity FROM products p JOIN product_color pc ON pc.product_id=p.id WHERE p.id=${item.product_id} AND pc.id=${item.product_color_id} AND p.is_active=true`)[0];
     const quantity=Number(item.quantity);
-    if(!product||!Number.isInteger(quantity)||quantity<1||quantity>product.stock_quantity)return res.status(409).json({error:'Product unavailable or insufficient stock.'});
-    prepared.push({product,quantity,subtotal:Number(product.price)*quantity});
-    total+=Number(product.price)*quantity;
+    if(!product||!Number.isInteger(quantity)||quantity<1)return res.status(409).json({error:'Product, selected color, or quantity is invalid.'});
+    const key=String(product.product_color_id),existing=requested.get(key);
+    requested.set(key,{product_id:product.id,product_color_id:product.product_color_id,quantity:(existing?.quantity||0)+quantity,product_name:product.name,color:product.color,unit_price:Number(product.price)});
   }
+  const prepared=[...requested.values()];
+  total=prepared.reduce((sum,item)=>sum+item.unit_price*item.quantity,0);
   const number=`ORD-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
-  const order=(await sql`INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,payment_method,payment_status,notification_channel,notification_destination) VALUES(${user?.id||null},${number},'PENDING',${shipping_name},${shipping_phone},${shipping_address},${total.toFixed(2)},${req.body.contact_email||user?.email||notification.destination},${req.body.contact_phone||user?.phone||shipping_phone},${paymentMethod},'UNPAID',${notification.channel},${notification.destination}) RETURNING *`)[0];
-  await sql`INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id) VALUES(${order.id},'ORDER_CREATED','PENDING','UNPAID',${user?'CUSTOMER':'GUEST'},${user?.id||null})`;
-  for(const item of prepared){
-    await sql`INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price,subtotal) VALUES(${order.id},${item.product.id},${item.product.name},${item.quantity},${item.product.price},${item.subtotal.toFixed(2)})`;
-    await sql`UPDATE products SET stock_quantity=stock_quantity-${item.quantity},updated_at=NOW() WHERE id=${item.product.id}`;
-  }
+  const payload=JSON.stringify(prepared);
+  const created=await sql.query(`
+    WITH requested AS MATERIALIZED (
+      SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(product_id bigint,product_color_id bigint,quantity integer,product_name text,color text,unit_price numeric)
+    ), locked AS MATERIALIZED (
+      SELECT pc.id,pc.product_id,pc.quantity available,r.quantity requested_quantity
+      FROM product_color pc JOIN requested r ON r.product_color_id=pc.id AND r.product_id=pc.product_id
+      ORDER BY pc.id FOR UPDATE OF pc
+    ), eligible AS MATERIALIZED (
+      SELECT COUNT(*)=(SELECT COUNT(*) FROM requested) AND COALESCE(BOOL_AND(available>=requested_quantity),false) ok FROM locked
+    ), reduced AS (
+      UPDATE product_color pc SET quantity=pc.quantity-r.quantity,updated_at=NOW()
+      FROM requested r,eligible e WHERE e.ok AND pc.id=r.product_color_id RETURNING pc.id
+    ), new_order AS (
+      INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,payment_method,payment_status,notification_channel,notification_destination)
+      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$10,'UNPAID',$11,$12 FROM eligible WHERE ok AND (SELECT COUNT(*) FROM reduced)=(SELECT COUNT(*) FROM requested)
+      RETURNING *
+    ), new_items AS (
+      INSERT INTO order_items(order_id,product_id,product_color_id,color,product_name,quantity,unit_price,subtotal)
+      SELECT o.id,r.product_id,r.product_color_id,r.color,r.product_name,r.quantity,r.unit_price,r.quantity*r.unit_price FROM new_order o CROSS JOIN requested r RETURNING id
+    ), new_event AS (
+      INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id)
+      SELECT id,'ORDER_CREATED','PENDING','UNPAID',$13,$2 FROM new_order RETURNING id
+    ) SELECT * FROM new_order WHERE (SELECT COUNT(*) FROM new_items)>0 AND (SELECT COUNT(*) FROM new_event)>0
+  `,[payload,user?.id||null,number,shipping_name,shipping_phone,shipping_address,total.toFixed(2),req.body.contact_email||user?.email||notification.destination,req.body.contact_phone||user?.phone||shipping_phone,paymentMethod,notification.channel,notification.destination,user?'CUSTOMER':'GUEST']);
+  const order=created[0];
+  if(!order)return res.status(409).json({error:'Insufficient stock for one or more selected colors.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
   order.notification=await sendOrderSummary(order);
   if(!user)order.order_access_token=orderAccessTokenFor(order);
@@ -100,16 +123,22 @@ router.put('/orders/:id',admin,async(req,res)=>{
         WHERE id=${req.params.id} AND status<>'CANCELLED'
         RETURNING *
       ), item_quantities AS (
-        SELECT oi.product_id,SUM(oi.quantity)::integer AS quantity
+        SELECT oi.product_color_id,SUM(oi.quantity)::integer AS quantity
         FROM order_items oi
         JOIN cancelled_order co ON co.id=oi.order_id
-        GROUP BY oi.product_id
-      ), restored_products AS (
-        UPDATE products p
-        SET stock_quantity=p.stock_quantity+iq.quantity,updated_at=NOW()
+        WHERE oi.product_color_id IS NOT NULL
+        GROUP BY oi.product_color_id
+      ), restored_colors AS (
+        UPDATE product_color p
+        SET quantity=p.quantity+iq.quantity,updated_at=NOW()
         FROM item_quantities iq
-        WHERE p.id=iq.product_id
+        WHERE p.id=iq.product_color_id
         RETURNING p.id
+      ), legacy_quantities AS (
+        SELECT oi.product_id,SUM(oi.quantity)::integer quantity FROM order_items oi JOIN cancelled_order co ON co.id=oi.order_id
+        WHERE oi.product_color_id IS NULL GROUP BY oi.product_id
+      ), restored_legacy_products AS (
+        UPDATE products p SET stock_quantity=p.stock_quantity+lq.quantity,updated_at=NOW() FROM legacy_quantities lq WHERE p.id=lq.product_id RETURNING p.id
       )
       INSERT INTO order_events(order_id,event_type,from_status,to_status,actor_type,actor_id)
       SELECT id,'STATUS_CHANGED',${current.status},'CANCELLED','ADMIN',${req.user.id} FROM cancelled_order

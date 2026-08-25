@@ -7,6 +7,7 @@ import carts from'./carts.js';
 import orders from'./orders.js';
 import payments,{stripeWebhook}from'./payments.js';
 import notifications from'./notifications.js';
+import productDescriptions from'./productDescriptions.js';
 import adminApi from'./admin.js';
 
 const defaultOrigins='http://localhost:5173,https://shilnsoul-react-admin.vercel.app,https://shilpnsoul-react-fe.vercel.app,https://shilpnsoul.com,https://www.shilpnsoul.com';
@@ -24,6 +25,7 @@ app.get('/api/health',async(req,res)=>{await sql`SELECT 1`;res.json({status:'ok'
 
 app.use('/api',login);
 app.use('/api',notifications);
+app.use('/api',productDescriptions);
 app.use('/api/users',users);
 app.use('/api',catalog);
 app.use('/api',carts);
@@ -35,6 +37,8 @@ app.use((error,req,res,next)=>{if(res.headersSent)return next(error);console.err
     if(error.code==='DATABASE_URL_MISSING')return res.status(503).json({error:'Database connection is not configured for this deployment.'});
     if(error.code==='STRIPE_CONFIG_MISSING')return res.status(503).json({error:error.message});
     if(error.code==='STRIPE_ACCOUNT_MISMATCH')return res.status(503).json({error:'Stripe account verification failed.'});
+    if(error.code==='LIMIT_FILE_SIZE')return res.status(413).json({error:'The uploaded document exceeds the 10 MB limit.'});
+    if(error.message==='Only .docx and .xlsx files are supported.')return res.status(400).json({error:error.message});
     if(error.message==='CORS origin denied')return res.status(403).json({error:error.message});
     if(error.code==='23505')return res.status(409).json({error:'Duplicate value.'});
     if(error.code==='23503')return res.status(409).json({error:'Record is referenced.'});return res.status(500).json({error:'Internal server error.'})});

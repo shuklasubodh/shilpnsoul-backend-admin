@@ -77,7 +77,7 @@ const descriptionAdmin=(req,res,next)=>{
   return authenticate(req,res,()=>admin(req,res,next));
 };
 
-router.use(descriptionAdmin);
+router.use('/product-descriptions',descriptionAdmin);
 
 router.get('/product-descriptions/import-format',(req,res)=>res.json({
   accepted_files:['.docx','.xlsx'],max_file_size_mb:10,file_field:'document',

@@ -51,6 +51,13 @@ const resources = {
     searchColumns: ['title', 'dimensions', 'color_description', 'pattern_craft', 'catalogue_description', 'festive_note'],
     responseKey: 'product_description',
   },
+  'product-colors': {
+    table: 'product_color',
+    columns: ['product_id', 'color', 'quantity'],
+    publicColumns: ['id', 'product_id', 'color', 'quantity', 'created_at', 'updated_at'],
+    searchColumns: ['color'],
+    responseKey: 'product_color',
+  },
 }
 
 const json = (response, status, body) => response.status(status).json(body)

@@ -44,6 +44,13 @@ const resources = {
     searchColumns: ['title', 'dimensions', 'color_description', 'pattern_craft', 'catalogue_description', 'festive_note'],
     responseKey: 'product_description',
   },
+  products_desccription: {
+    table: 'product_description',
+    columns: ['product_id', 'title', 'dimensions', 'color_description', 'pattern_craft', 'catalogue_description', 'festive_note'],
+    publicColumns: ['id', 'product_id', 'title', 'dimensions', 'color_description', 'pattern_craft', 'catalogue_description', 'festive_note', 'created_at', 'updated_at'],
+    searchColumns: ['title', 'dimensions', 'color_description', 'pattern_craft', 'catalogue_description', 'festive_note'],
+    responseKey: 'product_description',
+  },
 }
 
 const json = (response, status, body) => response.status(status).json(body)
@@ -93,6 +100,16 @@ const prepareValues = async (resourceName, columns, body) => Promise.all(
     return bcrypt.hash(String(value), BCRYPT_ROUNDS)
   }),
 )
+
+const normalizedResourceBody = (resourceName, source = {}) => {
+  if (!['product-descriptions', 'products_desccription'].includes(resourceName)) return source
+  return {
+    ...source,
+    title: source.title ?? source.name_of_product ?? source.product_name,
+    color_description: source.color_description ?? source.color ?? source.colour,
+    catalogue_description: source.catalogue_description ?? source.description,
+  }
+}
 
 const parseJson = (value, fallback) => {
   if (!value) return fallback
@@ -724,7 +741,7 @@ export default async function handler(request, response) {
     }
 
     if (request.method === 'POST' && !id) {
-      const body = request.body || {}
+      const body = normalizedResourceBody(resourceName, request.body || {})
       if (resourceName === 'users') {
         const requiredFields = ['first_name', 'last_name', 'email', 'password_hash', 'phone', 'role', 'is_active']
         const missingFields = requiredFields.filter((field) => body[field] === undefined || body[field] === '')
@@ -742,7 +759,7 @@ export default async function handler(request, response) {
     }
 
     if (request.method === 'PUT' && id) {
-      const body = request.body || {}
+      const body = normalizedResourceBody(resourceName, request.body || {})
       if (resourceName === 'orders' && body.status !== undefined) {
         const status = String(body.status).toUpperCase()
         const allowed = ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED']

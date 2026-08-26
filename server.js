@@ -19,6 +19,7 @@ app.use(cors({origin:(origin,callback)=>!origin||origins.includes(normalizeOrigi
 app.use('/api/payments/stripe/webhook',stripeWebhook);
 app.use(express.json({limit:'4mb'}));
 
+app.use('/api/admin',productDescriptions);
 app.use('/api/admin',(req,res)=>{const request=Object.create(req);Object.defineProperty(request,'query',{value:{...req.query,route:String(req.path||'').replace(/^\/+|\/+$/g,'')}});return adminApi(request,res)});
 
 app.get('/api/health',async(req,res)=>{await sql`SELECT 1`;res.json({status:'ok',database:'connected'})});

@@ -37,6 +37,13 @@ const resources = {
     searchColumns: ['order_number', 'status', 'shipping_address', 'payment_status'],
     responseKey: 'order',
   },
+  'product-descriptions': {
+    table: 'product_description',
+    columns: ['product_id', 'title', 'dimensions', 'color_description', 'pattern_craft', 'catalogue_description', 'festive_note'],
+    publicColumns: ['id', 'product_id', 'title', 'dimensions', 'color_description', 'pattern_craft', 'catalogue_description', 'festive_note', 'created_at', 'updated_at'],
+    searchColumns: ['title', 'dimensions', 'color_description', 'pattern_craft', 'catalogue_description', 'festive_note'],
+    responseKey: 'product_description',
+  },
 }
 
 const json = (response, status, body) => response.status(status).json(body)

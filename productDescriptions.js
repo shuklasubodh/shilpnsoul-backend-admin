@@ -1,8 +1,10 @@
 import {Router} from 'express';
 import path from 'node:path';
+import {createHash} from 'node:crypto';
 import multer from 'multer';
 import mammoth from 'mammoth';
 import ExcelJS from 'exceljs';
+import jwt from 'jsonwebtoken';
 import sql from './db.js';
 import {authenticate,admin} from './auth.js';
 
@@ -62,7 +64,20 @@ const validate=rows=>{
   return rows.map((row,index)=>({...row,row_number:index+2,errors:[...(!row.sku?['Product Code is required.']:[]),...(!row.title?['Title is required.']:[]),...(row.sku&&counts.get(row.sku.toLowerCase())>1?['Product Code is duplicated in this document.']:[])]}));
 };
 
-router.use(authenticate,admin);
+const descriptionAdmin=(req,res,next)=>{
+  const authorization=String(req.get('authorization')||''),token=authorization.startsWith('Bearer ')?authorization.slice(7):'';
+  const connectionString=process.env.DATABASE_URL||process.env.POSTGRES_URL;
+  const adminSecret=process.env.ADMIN_JWT_SECRET||(connectionString?createHash('sha256').update(`shilpnsoul-admin:${connectionString}`).digest('hex'):'');
+  if(token&&adminSecret){
+    try{
+      const session=jwt.verify(token,adminSecret,{algorithms:['HS256'],issuer:'shilpnsoul-admin',audience:'shilpnsoul-admin-web'});
+      if(session.role==='ADMIN'){req.adminSession=session;return next()}
+    }catch{/* Try the storefront administrator token below. */}
+  }
+  return authenticate(req,res,()=>admin(req,res,next));
+};
+
+router.use(descriptionAdmin);
 
 router.get('/product-descriptions/import-format',(req,res)=>res.json({
   accepted_files:['.docx','.xlsx'],max_file_size_mb:10,file_field:'document',

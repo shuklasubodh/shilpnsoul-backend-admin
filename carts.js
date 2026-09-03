@@ -11,16 +11,28 @@ router.get('/carts',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELE
 router.get('/carts/:id',async(req,res)=>{
   const cart=(await sql`SELECT * FROM carts WHERE id=${req.params.id}`)[0];
   if(!cart||!isAdmin(req.user)&&String(cart.user_id)!==String(req.user.id))return notFound(res,'Cart');
-  cart.items=await sql`SELECT ci.*,pc.color,pc.quantity available_quantity,p.name product_name,p.image_url FROM cart_items ci JOIN products p ON p.id=ci.product_id JOIN product_color pc ON pc.id=ci.product_color_id WHERE ci.cart_id=${req.params.id} ORDER BY ci.id`;
+  cart.items=await sql`SELECT ci.*,pc.color,COALESCE(pc.quantity,p.stock_quantity) available_quantity,p.name product_name,p.image_url FROM cart_items ci JOIN products p ON p.id=ci.product_id LEFT JOIN product_color pc ON pc.id=ci.product_color_id WHERE ci.cart_id=${req.params.id} ORDER BY ci.id`;
   return res.json(cart);
 });
 router.delete('/carts/:id',async(req,res)=>{const rows=isAdmin(req.user)?await sql`DELETE FROM carts WHERE id=${req.params.id} RETURNING *`:await sql`DELETE FROM carts WHERE id=${req.params.id} AND user_id=${req.user.id} RETURNING *`;return rows[0]?res.json(rows[0]):notFound(res,'Cart')});
 
 router.post('/cart-items',async(req,res)=>{
   const{cart_id,product_id,product_color_id}=req.body,quantity=Number(req.body.quantity);
-  const selected=(await sql`SELECT c.user_id,p.price,p.is_active,pc.quantity available_quantity FROM carts c CROSS JOIN products p JOIN product_color pc ON pc.product_id=p.id WHERE c.id=${cart_id} AND p.id=${product_id} AND pc.id=${product_color_id}`)[0];
+  const selected=(await sql`SELECT c.user_id,p.price,p.is_active,COALESCE(pc.quantity,p.stock_quantity) available_quantity,pc.id product_color_id,EXISTS(SELECT 1 FROM product_color x WHERE x.product_id=p.id) has_colors FROM carts c CROSS JOIN products p LEFT JOIN product_color pc ON pc.product_id=p.id AND pc.id=${product_color_id} WHERE c.id=${cart_id} AND p.id=${product_id}`)[0];
+  if(selected?.has_colors&&!selected.product_color_id)return res.status(400).json({error:'Select an available color before adding this product.'});
   if(!selected||!isAdmin(req.user)&&String(selected.user_id)!==String(req.user.id)||!selected.is_active||!Number.isInteger(quantity)||quantity<1)return res.status(400).json({error:'A valid cart item, color, and quantity are required.'});
   if(quantity>selected.available_quantity)return res.status(409).json({error:'Insufficient stock for the selected color.'});
+  if(!selected.has_colors){
+    const existing=(await sql`SELECT * FROM cart_items WHERE cart_id=${cart_id} AND product_id=${product_id} AND product_color_id IS NULL ORDER BY id LIMIT 1`)[0];
+    if(existing){
+      const next=Number(existing.quantity)+quantity;
+      if(next>selected.available_quantity)return res.status(409).json({error:'Insufficient stock for this product.'});
+      const rows=await sql`UPDATE cart_items SET quantity=${next},subtotal=${(Number(selected.price)*next).toFixed(2)},updated_at=NOW() WHERE id=${existing.id} RETURNING *`;
+      return res.status(200).json(rows[0]);
+    }
+    const rows=await sql`INSERT INTO cart_items(cart_id,product_id,product_color_id,quantity,unit_price,subtotal) VALUES(${cart_id},${product_id},NULL,${quantity},${selected.price},${(Number(selected.price)*quantity).toFixed(2)}) RETURNING *`;
+    return res.status(201).json(rows[0]);
+  }
   const rows=await sql`
     INSERT INTO cart_items(cart_id,product_id,product_color_id,quantity,unit_price,subtotal)
     VALUES(${cart_id},${product_id},${product_color_id},${quantity},${selected.price},${(Number(selected.price)*quantity).toFixed(2)})
@@ -34,7 +46,7 @@ router.post('/cart-items',async(req,res)=>{
 });
 
 router.put('/cart-items/:id',async(req,res)=>{
-  const quantity=Number(req.body.quantity),old=(await sql`SELECT ci.*,c.user_id,pc.quantity available_quantity FROM cart_items ci JOIN carts c ON c.id=ci.cart_id JOIN product_color pc ON pc.id=ci.product_color_id WHERE ci.id=${req.params.id}`)[0];
+  const quantity=Number(req.body.quantity),old=(await sql`SELECT ci.*,c.user_id,COALESCE(pc.quantity,p.stock_quantity) available_quantity FROM cart_items ci JOIN carts c ON c.id=ci.cart_id JOIN products p ON p.id=ci.product_id LEFT JOIN product_color pc ON pc.id=ci.product_color_id WHERE ci.id=${req.params.id}`)[0];
   if(!old||!isAdmin(req.user)&&String(old.user_id)!==String(req.user.id)||!Number.isInteger(quantity)||quantity<1||quantity>old.available_quantity)return res.status(400).json({error:'Invalid quantity for the selected color.'});
   const rows=await sql`UPDATE cart_items SET quantity=${quantity},subtotal=${(Number(old.unit_price)*quantity).toFixed(2)},updated_at=NOW() WHERE id=${req.params.id} RETURNING *`;
   return res.json(rows[0]);

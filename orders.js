@@ -51,11 +51,15 @@ const createOrder=async(req,res,user=null)=>{
   const requested=new Map();
   let total=0;
   for(const item of items){
-    const product=(await sql`SELECT p.*,pc.id product_color_id,pc.color,pc.quantity color_quantity FROM products p JOIN product_color pc ON pc.product_id=p.id WHERE p.id=${item.product_id} AND pc.id=${item.product_color_id} AND p.is_active=true`)[0];
+    const product=(await sql`SELECT p.*,pc.id product_color_id,pc.color,pc.quantity color_quantity,EXISTS(SELECT 1 FROM product_color x WHERE x.product_id=p.id) has_colors FROM products p LEFT JOIN product_color pc ON pc.product_id=p.id AND pc.id=${item.product_color_id} WHERE p.id=${item.product_id} AND p.is_active=true`)[0];
     const quantity=Number(item.quantity);
-    if(!product||!Number.isInteger(quantity)||quantity<1)return res.status(409).json({error:'Product, selected color, or quantity is invalid.'});
-    const key=String(product.product_color_id),existing=requested.get(key);
-    requested.set(key,{product_id:product.id,product_color_id:product.product_color_id,quantity:(existing?.quantity||0)+quantity,product_name:product.name,color:product.color,unit_price:Number(product.price)});
+    if(!product||!Number.isInteger(quantity)||quantity<1)return res.status(409).json({error:'Product or quantity is invalid.'});
+    if(product.has_colors&&!product.product_color_id)return res.status(409).json({error:`Select an available color for ${product.name}.`});
+    if(!product.has_colors&&item.product_color_id!=null)return res.status(409).json({error:`${product.name} does not have a color option.`});
+    const available=Number(product.has_colors?product.color_quantity:product.stock_quantity);
+    if(quantity>available)return res.status(409).json({error:`Insufficient stock for ${product.name}${product.color?` (${product.color})`:''}.`});
+    const key=product.product_color_id?`color:${product.product_color_id}`:`product:${product.id}`,existing=requested.get(key);
+    requested.set(key,{product_id:product.id,product_color_id:product.product_color_id||null,quantity:(existing?.quantity||0)+quantity,product_name:product.name,color:product.color||null,unit_price:Number(product.price)});
   }
   const prepared=[...requested.values()];
   total=prepared.reduce((sum,item)=>sum+item.unit_price*item.quantity,0);
@@ -64,18 +68,29 @@ const createOrder=async(req,res,user=null)=>{
   const created=await sql.query(`
     WITH requested AS MATERIALIZED (
       SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(product_id bigint,product_color_id bigint,quantity integer,product_name text,color text,unit_price numeric)
-    ), locked AS MATERIALIZED (
+    ), locked_colors AS MATERIALIZED (
       SELECT pc.id,pc.product_id,pc.quantity available,r.quantity requested_quantity
       FROM product_color pc JOIN requested r ON r.product_color_id=pc.id AND r.product_id=pc.product_id
       ORDER BY pc.id FOR UPDATE OF pc
+    ), locked_products AS MATERIALIZED (
+      SELECT p.id,p.stock_quantity available,r.quantity requested_quantity
+      FROM products p JOIN requested r ON r.product_id=p.id AND r.product_color_id IS NULL
+      ORDER BY p.id FOR UPDATE OF p
+    ), inventory AS MATERIALIZED (
+      SELECT available,requested_quantity FROM locked_colors
+      UNION ALL
+      SELECT available,requested_quantity FROM locked_products
     ), eligible AS MATERIALIZED (
-      SELECT COUNT(*)=(SELECT COUNT(*) FROM requested) AND COALESCE(BOOL_AND(available>=requested_quantity),false) ok FROM locked
-    ), reduced AS (
+      SELECT COUNT(*)=(SELECT COUNT(*) FROM requested) AND COALESCE(BOOL_AND(available>=requested_quantity),false) ok FROM inventory
+    ), reduced_colors AS (
       UPDATE product_color pc SET quantity=pc.quantity-r.quantity,updated_at=NOW()
-      FROM requested r,eligible e WHERE e.ok AND pc.id=r.product_color_id RETURNING pc.id
+      FROM requested r,eligible e WHERE e.ok AND r.product_color_id IS NOT NULL AND pc.id=r.product_color_id RETURNING pc.id
+    ), reduced_products AS (
+      UPDATE products p SET stock_quantity=p.stock_quantity-r.quantity,updated_at=NOW()
+      FROM requested r,eligible e WHERE e.ok AND r.product_color_id IS NULL AND p.id=r.product_id RETURNING p.id
     ), new_order AS (
       INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,payment_method,payment_status,notification_channel,notification_destination)
-      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$10,'UNPAID',$11,$12 FROM eligible WHERE ok AND (SELECT COUNT(*) FROM reduced)=(SELECT COUNT(*) FROM requested)
+      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$10,'UNPAID',$11,$12 FROM eligible WHERE ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
       RETURNING *
     ), new_items AS (
       INSERT INTO order_items(order_id,product_id,product_color_id,color,product_name,quantity,unit_price,subtotal)
@@ -86,7 +101,7 @@ const createOrder=async(req,res,user=null)=>{
     ) SELECT * FROM new_order WHERE (SELECT COUNT(*) FROM new_items)>0 AND (SELECT COUNT(*) FROM new_event)>0
   `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,notification.channel,notification.destination,user?'CUSTOMER':'GUEST']);
   const order=created[0];
-  if(!order)return res.status(409).json({error:'Insufficient stock for one or more selected colors.'});
+  if(!order)return res.status(409).json({error:'Insufficient stock for one or more selected products.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
   order.notification=await sendNotificationSummary(order);
   if(!user)order.order_access_token=orderAccessTokenFor(order);

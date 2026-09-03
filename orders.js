@@ -3,16 +3,35 @@ import crypto from 'node:crypto';
 import sql from './db.js';
 import {authenticate,admin,isAdmin,orderAccessTokenFor,verifyNotificationToken,verifyOrderAccessToken} from './auth.js';
 import {sendOrderSummary} from './email.js';
+import {normalizeWhatsAppNumber,sendOrderSummaryWhatsApp} from './whatsapp.js';
+import {sendOrderSummarySms} from './sms.js';
 import {notFound} from './utils.js';
 
 const router=Router();
 
+const sendNotificationSummary=async(order,{resend=false}={})=>{
+  if(order.notification_channel==='EMAIL')return sendOrderSummary(order,{resend});
+  const items=order.items||await sql`SELECT * FROM order_items WHERE order_id=${order.id} ORDER BY id`;
+  const idempotencyKey=resend?`order-summary/${order.id}/resend/${crypto.randomUUID()}`:`order-summary/${order.id}/created`;
+  const provider=order.notification_channel==='SMS'?'TWILIO':'META_WHATSAPP';
+  const delivery=(await sql`INSERT INTO notification_deliveries(order_id,notification_type,channel,destination,provider,status,idempotency_key) VALUES(${order.id},'ORDER_SUMMARY',${order.notification_channel},${order.notification_destination},${provider},'PENDING',${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=NOW() RETURNING *`)[0];
+  try{
+    const result=order.notification_channel==='SMS'?await sendOrderSummarySms({order,items}):await sendOrderSummaryWhatsApp({order,items});
+    await sql`UPDATE notification_deliveries SET status='ACCEPTED',provider_message_id=${result.id},updated_at=NOW() WHERE id=${delivery.id}`;
+    return{status:'ACCEPTED',message_id:result.id};
+  }catch(error){
+    await sql`UPDATE notification_deliveries SET status='FAILED',error_message=${String(error.message).slice(0,500)},updated_at=NOW() WHERE id=${delivery.id}`;
+    return{status:'FAILED'};
+  }
+};
+
 const verifiedNotification=async(req,user)=>{
-  const channel=String(req.body.notification_channel||'').toUpperCase(),destination=String(req.body.notification_destination||req.body.contact_email||'').trim().toLowerCase();
-  if(channel!=='EMAIL')throw Object.assign(new Error(channel==='WHATSAPP'?'WhatsApp notifications are not configured yet.':'Select and confirm an email notification channel.'),{status:channel==='WHATSAPP'?503:400});
-  if(user?.email_verified_at&&destination===String(user.email).toLowerCase())return{channel,destination};
+  const channel=String(req.body.notification_channel||'').toUpperCase(),destination=channel==='EMAIL'?String(req.body.notification_destination||req.body.contact_email||'').trim().toLowerCase():normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_phone);
+  if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||!destination)throw Object.assign(new Error('Select and confirm an email, SMS, or WhatsApp notification channel.'),{status:400});
+  if(user?.email_verified_at&&channel==='EMAIL'&&destination===String(user.email).toLowerCase())return{channel,destination};
+  if(user?.phone_verified_at&&['WHATSAPP','SMS'].includes(channel)&&destination===normalizeWhatsAppNumber(user.phone))return{channel,destination};
   let claims;
-  try{claims=verifyNotificationToken(req.body.notification_verification_token)}catch{throw Object.assign(new Error('Verify the selected email before placing the order.'),{status:403})}
+  try{claims=verifyNotificationToken(req.body.notification_verification_token)}catch{throw Object.assign(new Error('Verify the selected notification destination before placing the order.'),{status:403})}
   if(claims.type!=='notification-verification'||claims.purpose!=='CHECKOUT'||claims.channel!==channel||claims.destination!==destination)throw Object.assign(new Error('The notification verification does not match this order.'),{status:403});
   const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${claims.verification_id} AND verified_at IS NOT NULL`)[0];
   if(!challenge)throw Object.assign(new Error('Notification verification is incomplete.'),{status:403});
@@ -67,7 +86,7 @@ const createOrder=async(req,res,user=null)=>{
   const order=created[0];
   if(!order)return res.status(409).json({error:'Insufficient stock for one or more selected colors.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
-  order.notification=await sendOrderSummary(order);
+  order.notification=await sendNotificationSummary(order);
   if(!user)order.order_access_token=orderAccessTokenFor(order);
   return res.status(201).json(order);
 };
@@ -77,7 +96,7 @@ const resendOrderSummary=async(res,order)=>{
   if(recent.length>=3)return res.status(429).json({error:'Order summary resend limit reached. Try again in one hour.'});
   if(recent[0]&&Date.now()-new Date(recent[0].created_at).getTime()<60000)return res.status(429).json({error:'Please wait before resending the order summary.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
-  const notification=await sendOrderSummary(order,{resend:true});
+  const notification=await sendNotificationSummary(order,{resend:true});
   return notification.status==='ACCEPTED'?res.json(notification):res.status(503).json({error:'The order summary could not be sent. Please try again.'});
 };
 

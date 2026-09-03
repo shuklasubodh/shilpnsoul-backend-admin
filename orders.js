@@ -28,11 +28,10 @@ const sendNotificationSummary=async(order,{resend=false}={})=>{
 const verifiedNotification=async(req,user)=>{
   const channel=String(req.body.notification_channel||'').toUpperCase(),destination=channel==='EMAIL'?String(req.body.notification_destination||req.body.contact_email||'').trim().toLowerCase():normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_phone);
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||!destination)throw Object.assign(new Error('Select and confirm an email, SMS, or WhatsApp notification channel.'),{status:400});
-  if(user?.email_verified_at&&channel==='EMAIL'&&destination===String(user.email).toLowerCase())return{channel,destination};
-  if(user?.phone_verified_at&&['WHATSAPP','SMS'].includes(channel)&&destination===normalizeWhatsAppNumber(user.phone))return{channel,destination};
+  if(user&&(user.email_verified_at||user.phone_verified_at))return{channel,destination};
   let claims;
   try{claims=verifyNotificationToken(req.body.notification_verification_token)}catch{throw Object.assign(new Error('Verify the selected notification destination before placing the order.'),{status:403})}
-  if(claims.type!=='notification-verification'||claims.purpose!=='CHECKOUT'||claims.channel!==channel||claims.destination!==destination)throw Object.assign(new Error('The notification verification does not match this order.'),{status:403});
+  if(claims.type!=='notification-verification'||claims.purpose!=='CHECKOUT'||!['EMAIL','WHATSAPP','SMS'].includes(claims.channel))throw Object.assign(new Error('A verified email or phone number is required for this order.'),{status:403});
   const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${claims.verification_id} AND verified_at IS NOT NULL`)[0];
   if(!challenge)throw Object.assign(new Error('Notification verification is incomplete.'),{status:403});
   return{channel,destination};

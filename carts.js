@@ -4,7 +4,7 @@ import {authenticate,isAdmin} from './auth.js';
 import {notFound} from './utils.js';
 
 const router=Router();
-router.use(authenticate);
+router.use(['/carts','/cart-items'],authenticate);
 
 router.post('/carts',async(req,res)=>{const rows=await sql`INSERT INTO carts(user_id)VALUES(${req.user.id})RETURNING *`;return res.status(201).json(rows[0])});
 router.get('/carts',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELECT * FROM carts ORDER BY id DESC`:await sql`SELECT * FROM carts WHERE user_id=${req.user.id} ORDER BY id DESC`;res.set('X-Total-Count',rows.length);return res.json(rows)});

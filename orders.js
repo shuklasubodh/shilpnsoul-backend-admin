@@ -42,9 +42,12 @@ const createOrder=async(req,res,user=null)=>{
   const items=req.body.items;
   const paymentMethod=String(req.body.payment_method||'CASH').toUpperCase();
   if(!['CASH','STRIPE'].includes(paymentMethod))return res.status(400).json({error:'Payment method must be CASH or STRIPE.'});
-  if(!shipping_name||!shipping_phone||!shipping_address||!Array.isArray(items)||!items.length)return res.status(400).json({error:'Shipping and items required.'});
+  if(!shipping_name||!shipping_address||!Array.isArray(items)||!items.length)return res.status(400).json({error:'Shipping name, address, and items are required.'});
   let notification;
   try{notification=await verifiedNotification(req,user)}catch(error){return res.status(error.status||400).json({error:error.message})}
+  const contactEmail=String(req.body.contact_email||user?.email||'').trim().toLowerCase()||(notification.channel==='EMAIL'?notification.destination:null);
+  const contactPhone=normalizeWhatsAppNumber(req.body.contact_phone||user?.phone||shipping_phone)||(notification.channel==='EMAIL'?null:notification.destination);
+  const deliveryPhone=normalizeWhatsAppNumber(shipping_phone)||contactPhone||'';
   const requested=new Map();
   let total=0;
   for(const item of items){
@@ -81,7 +84,7 @@ const createOrder=async(req,res,user=null)=>{
       INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id)
       SELECT id,'ORDER_CREATED','PENDING','UNPAID',$13,$2 FROM new_order RETURNING id
     ) SELECT * FROM new_order WHERE (SELECT COUNT(*) FROM new_items)>0 AND (SELECT COUNT(*) FROM new_event)>0
-  `,[payload,user?.id||null,number,shipping_name,shipping_phone,shipping_address,total.toFixed(2),req.body.contact_email||user?.email||notification.destination,req.body.contact_phone||user?.phone||shipping_phone,paymentMethod,notification.channel,notification.destination,user?'CUSTOMER':'GUEST']);
+  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,notification.channel,notification.destination,user?'CUSTOMER':'GUEST']);
   const order=created[0];
   if(!order)return res.status(409).json({error:'Insufficient stock for one or more selected colors.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;

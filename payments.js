@@ -59,6 +59,12 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
 
 const router=Router();
 router.use(optionalAuthenticate);
+router.get('/checkout-sessions/:sessionId/result',async(req,res)=>{
+  const sessionId=String(req.params.sessionId||'').trim();
+  if(!/^cs_(?:test_|live_)?[A-Za-z0-9]+$/.test(sessionId))return res.status(400).json({error:'Invalid checkout session.'});
+  const result=(await sql`SELECT o.order_number,o.status,o.payment_status,o.notification_channel FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.stripe_checkout_session_id=${sessionId} ORDER BY p.id DESC LIMIT 1`)[0];
+  return result?res.json(result):notFound(res,'Checkout session');
+});
 const canAccessOrder=(req,order)=>{
   if(req.user&&String(order.user_id)===String(req.user.id))return true;
   try{const claims=verifyOrderAccessToken(req.get('x-order-access-token'));return claims.type==='guest-order'&&String(claims.sub)===String(order.id)&&claims.destination===order.notification_destination}catch{return false}

@@ -48,7 +48,7 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
           WHERE id=${order.id} AND payment_status<>'PAID' RETURNING id,status
         )
         INSERT INTO order_events(order_id,event_type,from_payment_status,to_payment_status,to_status,actor_type,metadata)
-        SELECT id,'PAYMENT_STATUS_CHANGED',${order.payment_status},'PAID',status,'SYSTEM',jsonb_build_object('provider','STRIPE','stripe_event_id',${event.id}) FROM paid
+        SELECT id,'PAYMENT_STATUS_CHANGED',${order.payment_status},'PAID',status,'SYSTEM',jsonb_build_object('provider','STRIPE','stripe_event_id',${event.id}::text) FROM paid
       `;
     }
   }else if(event.type==='checkout.session.async_payment_failed'||event.type==='checkout.session.expired'){

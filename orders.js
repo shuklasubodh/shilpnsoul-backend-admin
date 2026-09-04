@@ -134,7 +134,7 @@ router.post('/orders/:id/guest-notifications/resend',async(req,res)=>{
   return resendOrderSummary(res,order);
 });
 
-router.use(authenticate);
+router.use('/orders',authenticate);
 router.post('/orders',(req,res)=>createOrder(req,res,req.user));
 
 router.get('/orders',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELECT * FROM orders ORDER BY id DESC`:await sql`SELECT * FROM orders WHERE user_id=${req.user.id} AND customer_hidden_at IS NULL ORDER BY id DESC`;res.set('X-Total-Count',rows.length);return res.json(rows)});

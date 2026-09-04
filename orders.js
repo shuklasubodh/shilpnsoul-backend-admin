@@ -27,7 +27,10 @@ export const sendNotificationSummary=async(order,{resend=false}={})=>{
 };
 
 const verifiedNotification=async(req,user)=>{
-  const channel=String(req.body.notification_channel||'').toUpperCase(),destination=channel==='EMAIL'?String(req.body.notification_destination||req.body.contact_email||'').trim().toLowerCase():normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_phone);
+  const requestedChannel=String(req.body.notification_channel||'').toUpperCase();
+  const email=String(req.body.contact_email||user?.email||'').trim().toLowerCase();
+  const channel=email?'EMAIL':requestedChannel;
+  const destination=channel==='EMAIL'?email:normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_phone||user?.phone);
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||!destination)throw Object.assign(new Error('Select and confirm an email, SMS, or WhatsApp notification channel.'),{status:400});
   if(user&&(user.email_verified_at||user.phone_verified_at))return{channel,destination};
   let claims;

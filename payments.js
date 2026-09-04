@@ -75,8 +75,9 @@ router.post('/orders/:id/checkout',async(req,res)=>{
   if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
   if(order.payment_status==='PAID')return res.status(409).json({error:'Order is already paid.'});
   if(order.status==='CANCELLED')return res.status(409).json({error:'Cancelled orders cannot be paid.'});
-  const successUrl=process.env.PAYMENT_SUCCESS_URL,cancelUrl=process.env.PAYMENT_CANCEL_URL;
-  if(!successUrl||!cancelUrl)throw Object.assign(new Error('Payment return URLs are not configured.'),{code:'STRIPE_CONFIG_MISSING'});
+  const configuredSuccessUrl=process.env.PAYMENT_SUCCESS_URL,cancelUrl=process.env.PAYMENT_CANCEL_URL;
+  if(!configuredSuccessUrl||!cancelUrl)throw Object.assign(new Error('Payment return URLs are not configured.'),{code:'STRIPE_CONFIG_MISSING'});
+  const successUrl=configuredSuccessUrl.includes('{CHECKOUT_SESSION_ID}')?configuredSuccessUrl:`${configuredSuccessUrl}${configuredSuccessUrl.includes('?')?'&':'?'}session_id={CHECKOUT_SESSION_ID}`;
   const stripe=await verifiedStripeClient();
 
   const existing=(await sql`SELECT stripe_checkout_session_id FROM payments WHERE order_id=${order.id} AND status='PENDING' ORDER BY id DESC LIMIT 1`)[0];
@@ -102,7 +103,7 @@ router.post('/orders/:id/checkout',async(req,res)=>{
 });
 
 router.get('/orders/:id/payment',async(req,res)=>{
-  const order=(await sql`SELECT id,user_id,notification_destination,payment_method,payment_status FROM orders WHERE id=${req.params.id}`)[0];
+  const order=(await sql`SELECT id,user_id,order_number,status,notification_channel,notification_destination,payment_method,payment_status FROM orders WHERE id=${req.params.id}`)[0];
   if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
   const payment=(await sql`SELECT provider,method,status,amount,currency,paid_at,created_at,updated_at FROM payments WHERE order_id=${order.id} ORDER BY id DESC LIMIT 1`)[0]||null;
   return res.json({order_id:order.id,payment_method:order.payment_method,payment_status:order.payment_status,payment});

@@ -45,9 +45,9 @@ const createOrder=async(req,res,user=null)=>{
   if(!shipping_name||!shipping_address||!Array.isArray(items)||!items.length)return res.status(400).json({error:'Shipping name, address, and items are required.'});
   let notification;
   try{notification=await verifiedNotification(req,user)}catch(error){return res.status(error.status||400).json({error:error.message})}
-  const contactEmail=String(req.body.contact_email||user?.email||'').trim().toLowerCase()||(notification.channel==='EMAIL'?notification.destination:'');
-  const contactPhone=normalizeWhatsAppNumber(req.body.contact_phone||user?.phone||shipping_phone)||(notification.channel==='EMAIL'?'':notification.destination);
-  const deliveryPhone=normalizeWhatsAppNumber(shipping_phone)||contactPhone||'';
+  const contactEmail=String(req.body.contact_email||user?.email||'').trim().toLowerCase()||(notification.channel==='EMAIL'?notification.destination:null);
+  const contactPhone=normalizeWhatsAppNumber(req.body.contact_phone||user?.phone||shipping_phone)||(notification.channel==='EMAIL'?null:notification.destination);
+  const deliveryPhone=normalizeWhatsAppNumber(shipping_phone)||contactPhone||null;
   const requested=new Map();
   let total=0;
   for(const item of items){

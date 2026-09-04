@@ -3,6 +3,7 @@ import Stripe from 'stripe';
 import sql from './db.js';
 import {admin,optionalAuthenticate,verifyOrderAccessToken} from './auth.js';
 import {isId,notFound} from './utils.js';
+import {sendNotificationSummary} from './orders.js';
 
 let client;
 let accountVerification;
@@ -42,7 +43,7 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
       session.currency===currency()&&session.amount_total===minorUnits(order.total_amount);
     if(valid){
       await sql`UPDATE payments SET status='PAID',stripe_payment_intent_id=${String(session.payment_intent||'')},paid_at=NOW(),updated_at=NOW() WHERE order_id=${order.id} AND stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
-      await sql`
+      const paidEvents=await sql`
         WITH paid AS (
           UPDATE orders SET payment_status='PAID',status=CASE WHEN status='PENDING' THEN 'CONFIRMED' ELSE status END,updated_at=NOW()
           WHERE id=${order.id} AND payment_status<>'PAID' RETURNING id,status
@@ -50,6 +51,11 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
         INSERT INTO order_events(order_id,event_type,from_payment_status,to_payment_status,to_status,actor_type,metadata)
         SELECT id,'PAYMENT_STATUS_CHANGED',${order.payment_status},'PAID',status,'SYSTEM',jsonb_build_object('provider','STRIPE','stripe_event_id',${event.id}::text) FROM paid
       `;
+      if(paidEvents[0]){
+        const confirmed=(await sql`SELECT * FROM orders WHERE id=${order.id}`)[0];
+        confirmed.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id} ORDER BY id`;
+        await sendNotificationSummary(confirmed);
+      }
     }
   }else if(event.type==='checkout.session.async_payment_failed'||event.type==='checkout.session.expired'){
     await sql`UPDATE payments SET status=${event.type.endsWith('expired')?'EXPIRED':'FAILED'},updated_at=NOW() WHERE stripe_checkout_session_id=${session.id} AND status<>'PAID'`;

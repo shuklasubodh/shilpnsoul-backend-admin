@@ -9,7 +9,7 @@ import {notFound} from './utils.js';
 
 const router=Router();
 
-const sendNotificationSummary=async(order,{resend=false}={})=>{
+export const sendNotificationSummary=async(order,{resend=false}={})=>{
   if(order.notification_channel==='EMAIL')return sendOrderSummary(order,{resend});
   const items=order.items||await sql`SELECT * FROM order_items WHERE order_id=${order.id} ORDER BY id`;
   const idempotencyKey=resend?`order-summary/${order.id}/resend/${crypto.randomUUID()}`:`order-summary/${order.id}/created`;
@@ -20,6 +20,7 @@ const sendNotificationSummary=async(order,{resend=false}={})=>{
     await sql`UPDATE notification_deliveries SET status='ACCEPTED',provider_message_id=${result.id},updated_at=NOW() WHERE id=${delivery.id}`;
     return{status:'ACCEPTED',message_id:result.id};
   }catch(error){
+    console.error('Order notification failed',{orderId:order.id,channel:order.notification_channel,error:error.message,providerCode:error.providerCode,statusCode:error.statusCode});
     await sql`UPDATE notification_deliveries SET status='FAILED',error_message=${String(error.message).slice(0,500)},updated_at=NOW() WHERE id=${delivery.id}`;
     return{status:'FAILED'};
   }
@@ -103,7 +104,7 @@ const createOrder=async(req,res,user=null)=>{
   const order=created[0];
   if(!order)return res.status(409).json({error:'Insufficient stock for one or more selected products.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
-  order.notification=await sendNotificationSummary(order);
+  order.notification=paymentMethod==='STRIPE'?{status:'PENDING_PAYMENT'}:await sendNotificationSummary(order);
   if(!user)order.order_access_token=orderAccessTokenFor(order);
   return res.status(201).json(order);
 };

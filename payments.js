@@ -85,10 +85,11 @@ router.post('/orders/:id/checkout',async(req,res)=>{
     if(previous.status==='open'&&previous.url)return res.json({checkout_url:previous.url,session_id:previous.id});
   }
   const attempts=(await sql`SELECT COUNT(*)::int AS count FROM payments WHERE order_id=${order.id}`)[0].count;
+  const customerEmail=order.contact_email||req.user?.email||'';
   const session=await stripe.checkout.sessions.create({
     mode:'payment',
     payment_method_types:['card','paynow'],
-    customer_email:order.contact_email||req.user.email,
+    ...(customerEmail?{customer_email:customerEmail}:{}),
     client_reference_id:String(order.id),
     metadata:{order_id:String(order.id),order_number:order.order_number,user_id:String(req.user?.id||'guest')},
     line_items:[{quantity:1,price_data:{currency:currency(),unit_amount:minorUnits(order.total_amount),product_data:{name:`Order ${order.order_number}`}}}],

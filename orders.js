@@ -127,7 +127,7 @@ router.post('/orders/track',async(req,res)=>{
   const channel=String(req.body.channel||'EMAIL').toUpperCase();
   const destination=channel==='EMAIL'?String(req.body.destination||req.body.email||'').trim().toLowerCase():normalizeWhatsAppNumber(req.body.destination||req.body.phone);
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||!destination)return res.status(400).json({error:'Enter the email address or phone number used for order notifications.'});
-  const order=(await sql`SELECT * FROM orders WHERE order_number=${orderNumber} AND notification_channel=${channel} AND notification_destination=${destination} AND user_id IS NULL`)[0];
+  const order=(await sql`SELECT * FROM orders WHERE order_number=${orderNumber} AND user_id IS NULL AND ((${channel}='EMAIL' AND LOWER(contact_email)=${destination}) OR (${channel} IN ('SMS','WHATSAPP') AND contact_phone=${destination}))`)[0];
   if(!order)return res.status(404).json({error:'Guest order not found.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
   order.order_access_token=orderAccessTokenFor(order);
@@ -138,7 +138,11 @@ router.post('/orders/:id/guest-notifications/resend',async(req,res)=>{
   try{access=verifyOrderAccessToken(req.get('x-order-access-token'))}catch{return res.status(403).json({error:'Guest order access has expired.'})}
   const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id IS NULL`)[0];
   if(!order||access.type!=='guest-order'||String(access.sub)!==String(order.id)||access.destination!==order.notification_destination)return notFound(res,'Order');
-  return resendOrderSummary(res,order);
+  const channel=String(req.body.channel||order.notification_channel).toUpperCase();
+  if(!['EMAIL','WHATSAPP','SMS'].includes(channel))return res.status(400).json({error:'Select email, SMS, or WhatsApp.'});
+  const destination=channel==='EMAIL'?String(order.contact_email||'').trim().toLowerCase():normalizeWhatsAppNumber(order.contact_phone);
+  if(!destination)return res.status(400).json({error:`No ${channel==='EMAIL'?'email address':'phone number'} was captured for this order.`});
+  return resendOrderSummary(res,{...order,notification_channel:channel,notification_destination:destination});
 });
 
 router.use('/orders',authenticate);

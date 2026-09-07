@@ -15,6 +15,15 @@ const resendClient=()=>{
   return new Resend(process.env.RESEND_API_KEY);
 };
 
+export async function getEmailDeliveryStatus(messageId){
+  if(!messageId)return{status:'PENDING',provider_event:'queued'};
+  const result=await resendClient().emails.get(messageId);
+  if(result.error)throw Object.assign(new Error(result.error.message||'Unable to retrieve email delivery status.'),{statusCode:result.error.statusCode||400});
+  const providerEvent=String(result.data?.last_event||'queued').toLowerCase();
+  const status={delivered:'DELIVERED',opened:'DELIVERED',clicked:'DELIVERED',bounced:'BOUNCED',complained:'COMPLAINED',suppressed:'SUPPRESSED',failed:'FAILED',canceled:'FAILED'}[providerEvent]||'ACCEPTED';
+  return{status,provider_event:providerEvent};
+}
+
 const Frame=({preview,title,children})=>h(Html,{lang:'en',dir:'ltr'},h(Head),h(Body,{style:base},
   h(Preview,null,preview),h(Container,{lang:'en',dir:'ltr',style:container},
     h(Text,{style:{color:colors.brand,fontSize:'12px',fontWeight:'700',letterSpacing:'1px',margin:'0 0 18px'}},'SHILP & SOUL'),

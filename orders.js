@@ -2,7 +2,7 @@ import {Router} from 'express';
 import crypto from 'node:crypto';
 import sql from './db.js';
 import {authenticate,admin,isAdmin,orderAccessTokenFor,verifyNotificationToken,verifyOrderAccessToken} from './auth.js';
-import {sendOrderSummary} from './email.js';
+import {getEmailDeliveryStatus,sendOrderSummary} from './email.js';
 import {normalizeWhatsAppNumber,sendOrderSummaryWhatsApp} from './whatsapp.js';
 import {sendOrderSummarySms} from './sms.js';
 import {notFound} from './utils.js';
@@ -121,6 +121,23 @@ const resendOrderSummary=async(res,order)=>{
   return notification.status==='ACCEPTED'?res.json(notification):res.status(503).json({error:'The order summary could not be sent. Please try again.'});
 };
 
+const orderNotificationStatus=async(res,order)=>{
+  const delivery=(await sql`SELECT * FROM notification_deliveries WHERE order_id=${order.id} AND notification_type='ORDER_SUMMARY' AND channel=${order.notification_channel} ORDER BY created_at DESC LIMIT 1`)[0];
+  if(!delivery)return res.status(404).json({error:'No order notification has been requested yet.'});
+  let status=delivery.status,providerEvent=null,errorMessage=delivery.error_message||null;
+  if(delivery.provider==='RESEND'&&delivery.provider_message_id&&['PENDING','ACCEPTED'].includes(status)){
+    try{
+      const current=await getEmailDeliveryStatus(delivery.provider_message_id);
+      status=current.status;providerEvent=current.provider_event;
+      await sql`UPDATE notification_deliveries SET status=${status},updated_at=NOW() WHERE id=${delivery.id}`;
+    }catch(error){
+      console.error('Email delivery status check failed',{orderId:order.id,deliveryId:delivery.id,error:error.message});
+      errorMessage='Delivery status is temporarily unavailable.';
+    }
+  }
+  return res.json({channel:delivery.channel,status,provider_event:providerEvent,error:errorMessage});
+};
+
 router.post('/orders/guest',(req,res)=>createOrder(req,res));
 router.post('/orders/track',async(req,res)=>{
   const orderNumber=String(req.body.orderNumber||req.body.order_number||'').trim();
@@ -140,9 +157,25 @@ router.post('/orders/:id/guest-notifications/resend',async(req,res)=>{
   if(!order||access.type!=='guest-order'||String(access.sub)!==String(order.id)||access.destination!==order.notification_destination)return notFound(res,'Order');
   return resendOrderSummary(res,order);
 });
+router.get('/orders/:id/guest-notifications/status',async(req,res)=>{
+  let access;
+  try{access=verifyOrderAccessToken(req.get('x-order-access-token'))}catch{return res.status(403).json({error:'Guest order access has expired.'})}
+  const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id IS NULL`)[0];
+  if(!order||access.type!=='guest-order'||String(access.sub)!==String(order.id)||access.destination!==order.notification_destination)return notFound(res,'Order');
+  return orderNotificationStatus(res,order);
+});
 
 router.use('/orders',authenticate);
 router.post('/orders',(req,res)=>createOrder(req,res,req.user));
+
+router.get('/orders/:id/notifications/status',async(req,res)=>{
+  const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
+  if(!order)return notFound(res,'Order');
+  const channel=String(req.query.channel||order.notification_channel).toUpperCase();
+  const destination=channel==='EMAIL'?order.contact_email:order.contact_phone;
+  if(!['EMAIL','SMS','WHATSAPP'].includes(channel)||!destination)return res.status(400).json({error:'This notification channel is not available for the order.'});
+  return orderNotificationStatus(res,{...order,notification_channel:channel});
+});
 
 router.get('/orders',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELECT * FROM orders ORDER BY id DESC`:await sql`SELECT * FROM orders WHERE user_id=${req.user.id} AND customer_hidden_at IS NULL ORDER BY id DESC`;res.set('X-Total-Count',rows.length);return res.json(rows)});
 router.get('/orders/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&(String(order.user_id)!==String(req.user.id)||order.customer_hidden_at))return notFound(res,'Order');order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;return res.json(order)});

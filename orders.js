@@ -138,11 +138,7 @@ router.post('/orders/:id/guest-notifications/resend',async(req,res)=>{
   try{access=verifyOrderAccessToken(req.get('x-order-access-token'))}catch{return res.status(403).json({error:'Guest order access has expired.'})}
   const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id IS NULL`)[0];
   if(!order||access.type!=='guest-order'||String(access.sub)!==String(order.id)||access.destination!==order.notification_destination)return notFound(res,'Order');
-  const channel=String(req.body.channel||order.notification_channel).toUpperCase();
-  if(!['EMAIL','WHATSAPP','SMS'].includes(channel))return res.status(400).json({error:'Select email, SMS, or WhatsApp.'});
-  const destination=channel==='EMAIL'?String(order.contact_email||'').trim().toLowerCase():normalizeWhatsAppNumber(order.contact_phone);
-  if(!destination)return res.status(400).json({error:`No ${channel==='EMAIL'?'email address':'phone number'} was captured for this order.`});
-  return resendOrderSummary(res,{...order,notification_channel:channel,notification_destination:destination});
+  return resendOrderSummary(res,order);
 });
 
 router.use('/orders',authenticate);

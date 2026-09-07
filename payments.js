@@ -24,6 +24,17 @@ const verifiedStripeClient=async()=>{
 const currency=()=>String(process.env.STRIPE_CURRENCY||'sgd').toLowerCase();
 const minorUnits=value=>Math.round(Number(value)*100);
 
+const ensurePaidOrderNotification=async orderId=>{
+  const existing=(await sql`SELECT id,status FROM notification_deliveries WHERE order_id=${orderId} AND notification_type='ORDER_SUMMARY' ORDER BY created_at DESC LIMIT 1`)[0];
+  if(existing)return existing;
+  const confirmed=(await sql`SELECT * FROM orders WHERE id=${orderId} AND payment_status='PAID'`)[0];
+  if(!confirmed)return null;
+  confirmed.items=await sql`SELECT * FROM order_items WHERE order_id=${orderId} ORDER BY id`;
+  const notification=await sendNotificationSummary(confirmed);
+  console.log('Paid order notification processed',{orderId,channel:confirmed.notification_channel,status:notification.status});
+  return notification;
+};
+
 export const stripeWebhook=Router();
 stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,res)=>{
   if(!process.env.STRIPE_WEBHOOK_SECRET)return res.status(503).json({error:'Stripe webhook is not configured.'});
@@ -51,11 +62,7 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
         INSERT INTO order_events(order_id,event_type,from_payment_status,to_payment_status,to_status,actor_type,metadata)
         SELECT id,'PAYMENT_STATUS_CHANGED',${order.payment_status},'PAID',status,'SYSTEM',jsonb_build_object('provider','STRIPE','stripe_event_id',${event.id}::text) FROM paid
       `;
-      if(paidEvents[0]){
-        const confirmed=(await sql`SELECT * FROM orders WHERE id=${order.id}`)[0];
-        confirmed.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id} ORDER BY id`;
-        await sendNotificationSummary(confirmed);
-      }
+      await ensurePaidOrderNotification(order.id);
     }
   }else if(event.type==='checkout.session.async_payment_failed'||event.type==='checkout.session.expired'){
     await sql`UPDATE payments SET status=${event.type.endsWith('expired')?'EXPIRED':'FAILED'},updated_at=NOW() WHERE stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
@@ -68,7 +75,9 @@ router.use(optionalAuthenticate);
 router.get('/checkout-sessions/:sessionId/result',async(req,res)=>{
   const sessionId=String(req.params.sessionId||'').trim();
   if(!/^cs_(?:test_|live_)?[A-Za-z0-9]+$/.test(sessionId))return res.status(400).json({error:'Invalid checkout session.'});
-  const result=(await sql`SELECT o.order_number,o.status,o.payment_status,o.notification_channel FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.stripe_checkout_session_id=${sessionId} ORDER BY p.id DESC LIMIT 1`)[0];
+  const result=(await sql`SELECT o.id,o.order_number,o.status,o.payment_status,o.notification_channel FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.stripe_checkout_session_id=${sessionId} ORDER BY p.id DESC LIMIT 1`)[0];
+  if(result?.payment_status==='PAID')await ensurePaidOrderNotification(result.id);
+  if(result)delete result.id;
   return result?res.json(result):notFound(res,'Checkout session');
 });
 const canAccessOrder=(req,order)=>{

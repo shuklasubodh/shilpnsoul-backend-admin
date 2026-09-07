@@ -123,8 +123,11 @@ const resendOrderSummary=async(res,order)=>{
 
 router.post('/orders/guest',(req,res)=>createOrder(req,res));
 router.post('/orders/track',async(req,res)=>{
-  const orderNumber=String(req.body.orderNumber||req.body.order_number||'').trim(),email=String(req.body.email||'').trim().toLowerCase();
-  const order=(await sql`SELECT * FROM orders WHERE order_number=${orderNumber} AND LOWER(contact_email)=${email} AND user_id IS NULL`)[0];
+  const orderNumber=String(req.body.orderNumber||req.body.order_number||'').trim();
+  const channel=String(req.body.channel||'EMAIL').toUpperCase();
+  const destination=channel==='EMAIL'?String(req.body.destination||req.body.email||'').trim().toLowerCase():normalizeWhatsAppNumber(req.body.destination||req.body.phone);
+  if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||!destination)return res.status(400).json({error:'Enter the email address or phone number used for order notifications.'});
+  const order=(await sql`SELECT * FROM orders WHERE order_number=${orderNumber} AND notification_channel=${channel} AND notification_destination=${destination} AND user_id IS NULL`)[0];
   if(!order)return res.status(404).json({error:'Guest order not found.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
   order.order_access_token=orderAccessTokenFor(order);
@@ -218,7 +221,11 @@ router.get('/orders/:id/history',async(req,res)=>{
 router.post('/orders/:id/notifications/resend',async(req,res)=>{
   const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
   if(!order)return notFound(res,'Order');
-  return resendOrderSummary(res,order);
+  const channel=String(req.body.channel||order.notification_channel).toUpperCase();
+  if(!['EMAIL','WHATSAPP','SMS'].includes(channel))return res.status(400).json({error:'Select email, SMS, or WhatsApp.'});
+  const destination=channel==='EMAIL'?String(order.contact_email||req.user.email||'').trim().toLowerCase():normalizeWhatsAppNumber(order.contact_phone||req.user.phone);
+  if(!destination)return res.status(400).json({error:`No ${channel==='EMAIL'?'email address':'phone number'} is available for this order.`});
+  return resendOrderSummary(res,{...order,notification_channel:channel,notification_destination:destination});
 });
 router.get('/order-items/order/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&String(order.user_id)!==String(req.user.id))return res.status(403).json({error:'Access denied.'});return res.json(await sql`SELECT * FROM order_items WHERE order_id=${req.params.id}`)});
 

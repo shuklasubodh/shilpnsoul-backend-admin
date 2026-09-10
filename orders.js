@@ -6,8 +6,15 @@ import {getEmailDeliveryStatus,sendOrderSummary} from './email.js';
 import {normalizeWhatsAppNumber,sendOrderSummaryWhatsApp} from './whatsapp.js';
 import {sendOrderSummarySms} from './sms.js';
 import {notFound} from './utils.js';
+import {notificationChannels,resolveNotificationChannel,returnDeadlineOpen,verificationMatches} from './checkoutPolicy.js';
 
 const router=Router();
+
+const contactBelongsToCustomer=async(email,phone,whatsapp)=>{
+  if(email&&(await sql`SELECT id FROM users WHERE LOWER(email)=${email} LIMIT 1`)[0])return true;
+  if(phone&&(await sql`SELECT id FROM users WHERE phone=${phone} LIMIT 1`)[0])return true;
+  return Boolean(whatsapp&&(await sql`SELECT id FROM users WHERE whatsapp_number=${whatsapp} LIMIT 1`)[0]);
+};
 
 export const sendNotificationSummary=async(order,{resend=false}={})=>{
   if(order.notification_channel==='EMAIL')return sendOrderSummary(order,{resend});
@@ -27,16 +34,21 @@ export const sendNotificationSummary=async(order,{resend=false}={})=>{
 };
 
 const verifiedNotification=async(req,user)=>{
-  const requestedChannel=String(req.body.notification_channel||'').toUpperCase();
+  const requestedChannel=String(req.body.notification_channel||user?.preferred_notification_channel||'').toUpperCase();
   const email=String(req.body.contact_email||user?.email||'').trim().toLowerCase();
-  const channel=email?'EMAIL':requestedChannel;
-  const destination=channel==='EMAIL'?email:normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_phone||user?.phone);
-  if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||!destination)throw Object.assign(new Error('Select and confirm an email, SMS, or WhatsApp notification channel.'),{status:400});
-  if(user&&(user.email_verified_at||user.phone_verified_at))return{channel,destination};
+  const channel=resolveNotificationChannel({customer:Boolean(user),email,requestedChannel,preferredChannel:user?.preferred_notification_channel});
+  const destination=channel==='EMAIL'?email:channel==='WHATSAPP'?normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_whatsapp||user?.whatsapp_number):normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_phone||user?.phone);
+  if(!notificationChannels.includes(channel)||!destination)throw Object.assign(new Error('Select and confirm an email, SMS, or WhatsApp notification channel.'),{status:400});
+  if(user){
+    const expected=channel==='EMAIL'?String(user.email).toLowerCase():channel==='WHATSAPP'?normalizeWhatsAppNumber(user.whatsapp_number):normalizeWhatsAppNumber(user.phone);
+    const verified=channel==='EMAIL'?user.email_verified_at:channel==='SMS'?user.phone_verified_at:user.whatsapp_verified_at;
+    if(destination!==expected)throw Object.assign(new Error('Use the selected contact stored on your customer account.'),{status:403});
+    if(verified)return{channel,destination};
+  }
   let claims;
   try{claims=verifyNotificationToken(req.body.notification_verification_token)}catch{throw Object.assign(new Error('Verify the selected notification destination before placing the order.'),{status:403})}
-  if(claims.type!=='notification-verification'||claims.purpose!=='CHECKOUT'||!['EMAIL','WHATSAPP','SMS'].includes(claims.channel))throw Object.assign(new Error('A verified email or phone number is required for this order.'),{status:403});
-  const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${claims.verification_id} AND verified_at IS NOT NULL`)[0];
+  if(!verificationMatches({claims,channel,destination}))throw Object.assign(new Error('The verification must match the selected channel and destination.'),{status:403});
+  const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${claims.verification_id} AND channel=${channel} AND destination=${destination} AND purpose='CHECKOUT' AND verified_at IS NOT NULL AND (${user?.id||null}::bigint IS NULL OR user_id=${user?.id||null})`)[0];
   if(!challenge)throw Object.assign(new Error('Notification verification is incomplete.'),{status:403});
   return{channel,destination};
 };
@@ -50,8 +62,11 @@ const createOrder=async(req,res,user=null)=>{
   let notification;
   try{notification=await verifiedNotification(req,user)}catch(error){return res.status(error.status||400).json({error:error.message})}
   const contactEmail=String(req.body.contact_email||user?.email||'').trim().toLowerCase()||(notification.channel==='EMAIL'?notification.destination:null);
-  const contactPhone=normalizeWhatsAppNumber(req.body.contact_phone||user?.phone||shipping_phone)||(notification.channel==='EMAIL'?null:notification.destination);
+  const contactPhone=normalizeWhatsAppNumber(req.body.contact_phone||user?.phone||shipping_phone)||(notification.channel==='SMS'?notification.destination:null);
+  const contactWhatsapp=normalizeWhatsAppNumber(req.body.contact_whatsapp||user?.whatsapp_number)||(notification.channel==='WHATSAPP'?notification.destination:null);
   const deliveryPhone=normalizeWhatsAppNumber(shipping_phone)||contactPhone||null;
+  if(!user&&await contactBelongsToCustomer(contactEmail,contactPhone,contactWhatsapp))return res.status(409).json({error:'This contact belongs to a customer account. Log in before checking out.',code:'CUSTOMER_LOGIN_REQUIRED'});
+  const returnWindowDays=user?Number(user.return_window_days):2;
   const requested=new Map();
   let total=0;
   for(const item of items){
@@ -93,8 +108,8 @@ const createOrder=async(req,res,user=null)=>{
       UPDATE products p SET stock_quantity=p.stock_quantity-r.quantity,updated_at=NOW()
       FROM requested r,eligible e WHERE e.ok AND r.product_color_id IS NULL AND p.id=r.product_id RETURNING p.id
     ), new_order AS (
-      INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,payment_method,payment_status,notification_channel,notification_destination)
-      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$10,'UNPAID',$11,$12 FROM eligible WHERE ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
+      INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,contact_whatsapp,payment_method,payment_status,notification_channel,notification_destination,return_window_days)
+      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$15,$10,'UNPAID',$11,$12,$14 FROM eligible WHERE ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
       RETURNING *
     ), new_items AS (
       INSERT INTO order_items(order_id,product_id,product_color_id,color,product_name,quantity,unit_price,subtotal)
@@ -103,7 +118,7 @@ const createOrder=async(req,res,user=null)=>{
       INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id)
       SELECT id,'ORDER_CREATED','PENDING','UNPAID',$13,$2 FROM new_order RETURNING id
     ) SELECT * FROM new_order WHERE (SELECT COUNT(*) FROM new_items)>0 AND (SELECT COUNT(*) FROM new_event)>0
-  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,notification.channel,notification.destination,user?'CUSTOMER':'GUEST']);
+  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,notification.channel,notification.destination,user?'CUSTOMER':'GUEST',returnWindowDays,contactWhatsapp]);
   const order=created[0];
   if(!order)return res.status(409).json({error:'Insufficient stock for one or more selected products.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
@@ -138,13 +153,53 @@ const orderNotificationStatus=async(res,order)=>{
   return res.json({channel:delivery.channel,status,provider_event:providerEvent,error:errorMessage});
 };
 
+const createActionRequest=async(req,res,order,requestedByType)=>{
+  const actionType=String(req.body.action_type||'').toUpperCase();
+  const reason=String(req.body.reason||'').trim().slice(0,1000)||null;
+  if(!['CANCEL','RETURN'].includes(actionType))return res.status(400).json({error:'Action type must be CANCEL or RETURN.'});
+  if(actionType==='CANCEL'&&!['PENDING','CONFIRMED','PROCESSING'].includes(order.status))return res.status(409).json({error:'This order can no longer be cancelled.'});
+  let orderItemId=null,quantity=null;
+  if(actionType==='RETURN'){
+    if(!['DELIVERED','RETURNED'].includes(order.status)||!order.delivered_at)return res.status(409).json({error:'Only delivered orders can be returned.'});
+    if(!returnDeadlineOpen({deliveredAt:order.delivered_at,windowDays:order.return_window_days||2}))return res.status(409).json({error:`The ${order.return_window_days||2}-day return window has closed.`});
+    orderItemId=String(req.body.order_item_id||'');quantity=Number(req.body.quantity);
+    const item=/^\d+$/.test(orderItemId)?(await sql`SELECT id,quantity FROM order_items WHERE id=${orderItemId} AND order_id=${order.id}`)[0]:null;
+    if(!item||!Number.isInteger(quantity)||quantity<1)return res.status(400).json({error:'Select a valid order item and return quantity.'});
+    const committed=(await sql`SELECT COALESCE(SUM(quantity),0)::int quantity FROM order_action_requests WHERE order_item_id=${item.id} AND action_type='RETURN' AND status IN ('REVIEW','APPROVED')`)[0];
+    if(quantity+Number(committed.quantity)>Number(item.quantity))return res.status(409).json({error:'The requested return quantity exceeds the quantity eligible for return.'});
+  }
+  try{
+    const created=(await sql`WITH request AS (
+      INSERT INTO order_action_requests(order_id,order_item_id,action_type,original_order_status,quantity,reason,requested_by_type,requested_by_id)
+      VALUES(${order.id},${orderItemId},${actionType},${order.status},${quantity},${reason},${requestedByType},${req.user?.id||null}) RETURNING *
+    ), changed AS (
+      UPDATE orders SET status=${actionType==='RETURN'?'RETURN_REVIEW':'CANCEL_REVIEW'},updated_at=NOW() WHERE id=${order.id} RETURNING id
+    ) SELECT request.* FROM request,changed`)[0];
+    await sql`INSERT INTO order_events(order_id,event_type,from_status,to_status,actor_type,actor_id,metadata) VALUES(${order.id},${actionType+'_REQUESTED'},${order.status},${actionType==='RETURN'?'RETURN_REVIEW':'CANCEL_REVIEW'},${requestedByType},${req.user?.id||null},jsonb_build_object('request_id',${created.id}::bigint))`;
+    return res.status(201).json(created);
+  }catch(error){
+    if(error.code==='23505')return res.status(409).json({error:'This order already has a matching request under review.'});
+    throw error;
+  }
+};
+
+const guestOrderForAction=async(req)=>{
+  let access;try{access=verifyOrderAccessToken(req.get('x-order-access-token'))}catch{return null}
+  const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id IS NULL`)[0];
+  return order&&access.type==='guest-order'&&String(access.sub)===String(order.id)&&access.destination===order.notification_destination?order:null;
+};
+
 router.post('/orders/guest',(req,res)=>createOrder(req,res));
+router.post('/orders/:id/guest-actions',async(req,res)=>{
+  const order=await guestOrderForAction(req);
+  return order?createActionRequest(req,res,order,'GUEST'):notFound(res,'Order');
+});
 router.post('/orders/track',async(req,res)=>{
   const orderNumber=String(req.body.orderNumber||req.body.order_number||'').trim();
   const channel=String(req.body.channel||'EMAIL').toUpperCase();
   const destination=channel==='EMAIL'?String(req.body.destination||req.body.email||'').trim().toLowerCase():normalizeWhatsAppNumber(req.body.destination||req.body.phone);
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||!destination)return res.status(400).json({error:'Enter the email address or phone number used for order notifications.'});
-  const order=(await sql`SELECT * FROM orders WHERE order_number=${orderNumber} AND user_id IS NULL AND ((${channel}='EMAIL' AND LOWER(contact_email)=${destination}) OR (${channel} IN ('SMS','WHATSAPP') AND contact_phone=${destination}))`)[0];
+  const order=(await sql`SELECT * FROM orders WHERE order_number=${orderNumber} AND user_id IS NULL AND ((${channel}='EMAIL' AND LOWER(contact_email)=${destination}) OR (${channel}='SMS' AND contact_phone=${destination}) OR (${channel}='WHATSAPP' AND contact_whatsapp=${destination}))`)[0];
   if(!order)return res.status(404).json({error:'Guest order not found.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
   order.order_access_token=orderAccessTokenFor(order);
@@ -167,12 +222,53 @@ router.get('/orders/:id/guest-notifications/status',async(req,res)=>{
 
 router.use('/orders',authenticate);
 router.post('/orders',(req,res)=>createOrder(req,res,req.user));
+router.post('/orders/:id/actions',async(req,res)=>{
+  const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
+  return order?createActionRequest(req,res,order,'CUSTOMER'):notFound(res,'Order');
+});
+router.get('/orders/action-requests/review',admin,async(req,res)=>{
+  const rows=await sql`SELECT ar.*,o.order_number,o.status order_status,oi.product_name,oi.color,oi.quantity ordered_quantity
+    FROM order_action_requests ar JOIN orders o ON o.id=ar.order_id LEFT JOIN order_items oi ON oi.id=ar.order_item_id
+    WHERE ar.status='REVIEW' ORDER BY ar.requested_at`;
+  res.set('X-Total-Count',rows.length);return res.json(rows);
+});
+router.post('/orders/action-requests/:requestId/decision',admin,async(req,res)=>{
+  const decision=String(req.body.decision||'').toUpperCase(),note=String(req.body.note||'').trim().slice(0,1000)||null;
+  if(!['APPROVED','REJECTED'].includes(decision))return res.status(400).json({error:'Decision must be APPROVED or REJECTED.'});
+  const request=(await sql`SELECT ar.*,o.status order_status FROM order_action_requests ar JOIN orders o ON o.id=ar.order_id WHERE ar.id=${req.params.requestId}`)[0];
+  if(!request)return notFound(res,'Action request');
+  if(request.status!=='REVIEW')return res.status(409).json({error:'This request has already been decided.'});
+  const finalStatus=decision==='APPROVED'?(request.action_type==='CANCEL'?'CANCELLED':'RETURNED'):request.original_order_status;
+  const rows=await sql.query(`
+    WITH decided AS (
+      UPDATE order_action_requests SET status=$1,decided_by=$2,decided_at=NOW(),decision_note=$3,updated_at=NOW()
+      WHERE id=$4 AND status='REVIEW' RETURNING *
+    ), changed AS (
+      UPDATE orders SET status=$5,updated_at=NOW() FROM decided WHERE orders.id=decided.order_id RETURNING orders.id
+    ), restore_rows AS (
+      SELECT oi.product_id,oi.product_color_id,SUM(CASE WHEN d.action_type='CANCEL' THEN oi.quantity ELSE d.quantity END)::integer quantity
+      FROM decided d JOIN order_items oi ON oi.order_id=d.order_id
+      WHERE $1='APPROVED' AND (d.action_type='CANCEL' OR oi.id=d.order_item_id)
+      GROUP BY oi.product_id,oi.product_color_id
+    ), restore_colors AS (
+      UPDATE product_color pc SET quantity=pc.quantity+r.quantity,updated_at=NOW()
+      FROM restore_rows r WHERE r.product_color_id IS NOT NULL AND pc.id=r.product_color_id RETURNING pc.id
+    ), restore_products AS (
+      UPDATE products p SET stock_quantity=p.stock_quantity+r.quantity,updated_at=NOW()
+      FROM restore_rows r WHERE r.product_color_id IS NULL AND p.id=r.product_id RETURNING p.id
+    )
+    SELECT d.* FROM decided d,changed
+  `,[decision,req.user.id,note,request.id,finalStatus]);
+  if(!rows[0])return res.status(409).json({error:'This request was decided by another administrator.'});
+  await sql`INSERT INTO order_events(order_id,event_type,from_status,to_status,actor_type,actor_id,metadata) VALUES(${request.order_id},${request.action_type+'_'+decision},${request.order_status},${finalStatus},'ADMIN',${req.user.id},jsonb_build_object('request_id',${request.id}::bigint))`;
+  return res.json(rows[0]);
+});
 
 router.get('/orders/:id/notifications/status',async(req,res)=>{
   const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id=${req.user.id}`)[0];
   if(!order)return notFound(res,'Order');
   const channel=String(req.query.channel||order.notification_channel).toUpperCase();
-  const destination=channel==='EMAIL'?order.contact_email:order.contact_phone;
+  const destination=channel==='EMAIL'?order.contact_email:channel==='WHATSAPP'?order.contact_whatsapp:order.contact_phone;
   if(!['EMAIL','SMS','WHATSAPP'].includes(channel)||!destination)return res.status(400).json({error:'This notification channel is not available for the order.'});
   return orderNotificationStatus(res,{...order,notification_channel:channel});
 });
@@ -181,10 +277,11 @@ router.get('/orders',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SEL
 router.get('/orders/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&(String(order.user_id)!==String(req.user.id)||order.customer_hidden_at))return notFound(res,'Order');order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;return res.json(order)});
 router.put('/orders/:id',admin,async(req,res)=>{
   const status=String(req.body.status||'').toUpperCase();
-  if(!['PENDING','CONFIRMED','PROCESSING','SHIPPED','DELIVERED','CANCELLED','RETURNED'].includes(status))return res.status(400).json({error:'Invalid status.'});
+  if(!['PENDING','CONFIRMED','PROCESSING','SHIPPED','DELIVERED'].includes(status))return res.status(400).json({error:'Cancellation and return statuses require the review workflow.'});
 
   const current=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];
   if(!current)return notFound(res,'Order');
+  if(['CANCEL_REVIEW','RETURN_REVIEW'].includes(current.status))return res.status(409).json({error:'Decide the open cancellation or return request before changing this order.'});
   if(current.status==='CANCELLED'){
     if(status==='CANCELLED')return res.json(current);
     return res.status(409).json({error:'Cancelled orders cannot be reopened.'});
@@ -226,7 +323,7 @@ router.put('/orders/:id',admin,async(req,res)=>{
     return latest?res.json(latest):notFound(res,'Order');
   }
 
-  const rows=await sql`WITH changed AS (UPDATE orders SET status=${status},updated_at=NOW() WHERE id=${req.params.id} AND status<>'CANCELLED' RETURNING *) INSERT INTO order_events(order_id,event_type,from_status,to_status,actor_type,actor_id) SELECT id,'STATUS_CHANGED',${current.status},${status},'ADMIN',${req.user.id} FROM changed RETURNING (SELECT row_to_json(c) FROM changed c) AS order`;
+  const rows=await sql`WITH changed AS (UPDATE orders SET status=${status},delivered_at=CASE WHEN ${status}='DELIVERED' THEN COALESCE(delivered_at,NOW()) ELSE delivered_at END,updated_at=NOW() WHERE id=${req.params.id} AND status NOT IN ('CANCELLED','RETURNED') RETURNING *) INSERT INTO order_events(order_id,event_type,from_status,to_status,actor_type,actor_id) SELECT id,'STATUS_CHANGED',${current.status},${status},'ADMIN',${req.user.id} FROM changed RETURNING (SELECT row_to_json(c) FROM changed c) AS order`;
   if(rows[0]?.order)return res.json(rows[0].order);
   return res.status(409).json({error:'Cancelled orders cannot be reopened.'});
 });
@@ -256,7 +353,7 @@ router.post('/orders/:id/notifications/resend',async(req,res)=>{
   if(!order)return notFound(res,'Order');
   const channel=String(req.body.channel||order.notification_channel).toUpperCase();
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel))return res.status(400).json({error:'Select email, SMS, or WhatsApp.'});
-  const destination=channel==='EMAIL'?String(order.contact_email||req.user.email||'').trim().toLowerCase():normalizeWhatsAppNumber(order.contact_phone||req.user.phone);
+  const destination=channel==='EMAIL'?String(order.contact_email||req.user.email||'').trim().toLowerCase():channel==='WHATSAPP'?normalizeWhatsAppNumber(order.contact_whatsapp||req.user.whatsapp_number):normalizeWhatsAppNumber(order.contact_phone||req.user.phone);
   if(!destination)return res.status(400).json({error:`No ${channel==='EMAIL'?'email address':'phone number'} is available for this order.`});
   return resendOrderSummary(res,{...order,notification_channel:channel,notification_destination:destination});
 });

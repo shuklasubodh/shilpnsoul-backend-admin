@@ -16,9 +16,18 @@ router.post('/notification-verifications/request',optionalAuthenticate,async(req
   const channel=String(req.body.channel||'').toUpperCase(),purpose=String(req.body.purpose||'').toUpperCase(),destination=normalize(channel,req.body.destination);
   if(!['REGISTRATION','CHECKOUT'].includes(purpose))return res.status(400).json({error:'Invalid verification purpose.'});
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||(channel==='EMAIL'?!emailPattern.test(destination):!destination))return res.status(400).json({error:'A valid email or mobile notification destination is required.'});
-  if(req.user&&['WHATSAPP','SMS'].includes(channel)&&destination!==normalizeWhatsAppNumber(req.user.phone))return res.status(403).json({error:'Verify the mobile number stored on your account.'});
+  if(!req.user&&purpose==='CHECKOUT'){
+    const existing=channel==='EMAIL'
+      ?(await sql`SELECT id FROM users WHERE LOWER(email)=${destination} LIMIT 1`)[0]
+      :channel==='WHATSAPP'?(await sql`SELECT id FROM users WHERE whatsapp_number=${destination} LIMIT 1`)[0]
+      :(await sql`SELECT id FROM users WHERE phone=${destination} LIMIT 1`)[0];
+    if(existing)return res.status(409).json({error:'This contact belongs to a customer account. Log in before checking out.',code:'CUSTOMER_LOGIN_REQUIRED'});
+  }
+  const expectedAccountDestination=channel==='EMAIL'?String(req.user?.email||'').toLowerCase():channel==='WHATSAPP'?normalizeWhatsAppNumber(req.user?.whatsapp_number):normalizeWhatsAppNumber(req.user?.phone);
+  if(req.user&&destination!==expectedAccountDestination)return res.status(403).json({error:'Verify the selected contact stored on your account.'});
   if(req.user&&purpose==='CHECKOUT'&&destination===String(req.user.email).toLowerCase()&&req.user.email_verified_at)return res.json({verified:true,channel,destination});
-  if(req.user&&purpose==='CHECKOUT'&&['WHATSAPP','SMS'].includes(channel)&&destination===normalizeWhatsAppNumber(req.user.phone)&&req.user.phone_verified_at)return res.json({verified:true,channel,destination});
+  if(req.user&&purpose==='CHECKOUT'&&channel==='SMS'&&destination===normalizeWhatsAppNumber(req.user.phone)&&req.user.phone_verified_at)return res.json({verified:true,channel,destination});
+  if(req.user&&purpose==='CHECKOUT'&&channel==='WHATSAPP'&&destination===normalizeWhatsAppNumber(req.user.whatsapp_number)&&req.user.whatsapp_verified_at)return res.json({verified:true,channel,destination});
 
   const recent=await sql`SELECT nv.created_at FROM notification_verifications nv JOIN notification_deliveries nd ON nd.verification_id=nv.id WHERE nv.channel=${channel} AND nv.destination=${destination} AND nv.created_at>NOW()-INTERVAL '1 hour' AND nd.status IN ('PENDING','ACCEPTED','DELIVERED') ORDER BY nv.created_at DESC`;
   if(recent[0]&&Date.now()-new Date(recent[0].created_at).getTime()<60000)return res.status(429).json({error:'Please wait before requesting another code.',retry_after_seconds:60-Math.floor((Date.now()-new Date(recent[0].created_at).getTime())/1000)});
@@ -56,7 +65,8 @@ router.post('/notification-verifications/verify',optionalAuthenticate,async(req,
   }
   await sql`UPDATE notification_verifications SET verified_at=NOW() WHERE id=${id}`;
   if(req.user&&verification.channel==='EMAIL'&&verification.destination===String(req.user.email).toLowerCase())await sql`UPDATE users SET email_verified_at=NOW(),updated_at=NOW() WHERE id=${req.user.id}`;
-  if(req.user&&['WHATSAPP','SMS'].includes(verification.channel)&&verification.destination===normalizeWhatsAppNumber(req.user.phone))await sql`UPDATE users SET phone_verified_at=NOW(),updated_at=NOW() WHERE id=${req.user.id}`;
+  if(req.user&&verification.channel==='SMS'&&verification.destination===normalizeWhatsAppNumber(req.user.phone))await sql`UPDATE users SET phone_verified_at=NOW(),updated_at=NOW() WHERE id=${req.user.id}`;
+  if(req.user&&verification.channel==='WHATSAPP'&&verification.destination===normalizeWhatsAppNumber(req.user.whatsapp_number))await sql`UPDATE users SET whatsapp_verified_at=NOW(),updated_at=NOW() WHERE id=${req.user.id}`;
   const verificationToken=notificationTokenFor({channel:verification.channel,destination:verification.destination,purpose:verification.purpose,verificationId:verification.id});
   return res.json({verified:true,channel:verification.channel,destination:verification.destination,verification_token:verificationToken});
 });

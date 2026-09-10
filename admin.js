@@ -11,9 +11,9 @@ const bcryptHashPattern = /^\$2[aby]\$\d{2}\$.{53}$/
 const resources = {
   users: {
     table: 'users',
-    columns: ['first_name', 'last_name', 'email', 'password_hash', 'phone', 'role', 'is_active'],
-    publicColumns: ['id', 'first_name', 'last_name', 'email', 'phone', 'role', 'is_active', 'created_at', 'updated_at'],
-    searchColumns: ['first_name', 'last_name', 'email', 'phone', 'role'],
+    columns: ['first_name', 'last_name', 'email', 'password_hash', 'country_code', 'phone', 'whatsapp_number', 'role', 'is_active', 'preferred_notification_channel', 'return_window_days'],
+    publicColumns: ['id', 'first_name', 'last_name', 'email', 'country_code', 'phone', 'whatsapp_number', 'role', 'is_active', 'email_verified_at', 'phone_verified_at', 'whatsapp_verified_at', 'preferred_notification_channel', 'return_window_days', 'created_at', 'updated_at'],
+    searchColumns: ['first_name', 'last_name', 'email', 'phone', 'whatsapp_number', 'role'],
     responseKey: 'user',
   },
   products: {
@@ -109,6 +109,16 @@ const prepareValues = async (resourceName, columns, body) => Promise.all(
 )
 
 const normalizedResourceBody = (resourceName, source = {}) => {
+  if (resourceName === 'users') {
+    const countryCode=`+${String(source.country_code||'').replace(/\D/g,'')}`
+    const international=(value)=>{
+      const raw=String(value||'').trim()
+      if(raw.startsWith('+'))return raw
+      const local=raw.replace(/\D/g,'').replace(/^0+/,'')
+      return local&&/^\+[1-9]\d{0,3}$/.test(countryCode)?`${countryCode}${local}`:raw
+    }
+    return {...source,country_code:countryCode,phone:source.phone===undefined?undefined:international(source.phone),whatsapp_number:source.whatsapp_number===undefined?undefined:international(source.whatsapp_number)}
+  }
   if (!['product-descriptions', 'products_desccription'].includes(resourceName)) return source
   return {
     ...source,
@@ -750,7 +760,7 @@ export default async function handler(request, response) {
     if (request.method === 'POST' && !id) {
       const body = normalizedResourceBody(resourceName, request.body || {})
       if (resourceName === 'users') {
-        const requiredFields = ['first_name', 'last_name', 'email', 'password_hash', 'phone', 'role', 'is_active']
+        const requiredFields = ['first_name', 'last_name', 'email', 'password_hash', 'country_code', 'phone', 'whatsapp_number', 'role', 'is_active']
         const missingFields = requiredFields.filter((field) => body[field] === undefined || body[field] === '')
         if (missingFields.length) return json(response, 400, { error: `Missing required fields: ${missingFields.join(', ')}.` })
       }
@@ -769,16 +779,17 @@ export default async function handler(request, response) {
       const body = normalizedResourceBody(resourceName, request.body || {})
       if (resourceName === 'orders' && body.status !== undefined) {
         const status = String(body.status).toUpperCase()
-        const allowed = ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED']
+        const allowed = ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED']
         if (!allowed.includes(status)) return json(response, 400, { error: 'Invalid order status.' })
         const currentRows = await sql.query('SELECT * FROM orders WHERE id = $1', [id])
         if (!currentRows.length) return json(response, 404, { error: 'Record not found.' })
         const current = currentRows[0]
         if (current.status === status) return json(response, 200, { message: 'Order status is unchanged.', order: current })
+        if (['CANCEL_REVIEW', 'RETURN_REVIEW'].includes(current.status)) return json(response, 409, { error: 'Decide the open cancellation or return request before changing this order.' })
         if (current.status === 'CANCELLED') return json(response, 409, { error: 'Cancelled orders cannot be reopened.' })
         const rows = await sql.query(`
           WITH changed AS (
-            UPDATE orders SET status=$1,updated_at=NOW() WHERE id=$2 AND status<>'CANCELLED' RETURNING *
+            UPDATE orders SET status=$1,delivered_at=CASE WHEN $1='DELIVERED' THEN COALESCE(delivered_at,NOW()) ELSE delivered_at END,updated_at=NOW() WHERE id=$2 AND status NOT IN ('CANCELLED','RETURNED') RETURNING *
           ), quantities AS (
             SELECT oi.product_color_id,SUM(oi.quantity)::integer AS quantity FROM order_items oi JOIN changed c ON c.id=oi.order_id
             WHERE $1='CANCELLED' AND oi.product_color_id IS NOT NULL GROUP BY oi.product_color_id

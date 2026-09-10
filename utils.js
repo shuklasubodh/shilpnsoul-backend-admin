@@ -1,4 +1,4 @@
-export const userColumns='id,first_name,last_name,email,country_code,phone,role,is_active,email_verified_at,phone_verified_at,created_at,updated_at';
+export const userColumns='id,first_name,last_name,email,country_code,phone,whatsapp_number,role,is_active,email_verified_at,phone_verified_at,whatsapp_verified_at,preferred_notification_channel,return_window_days,created_at,updated_at';
 export const isId=value=>/^\d+$/.test(String(value))&&Number(value)>0;
 export const emailPattern=/^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export const normalizeCountryCode=value=>{const digits=String(value||'').replace(/\D/g,'');return /^[1-9]\d{0,3}$/.test(digits)?`+${digits}`:''};

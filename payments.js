@@ -89,7 +89,7 @@ router.post('/orders/:id/checkout',async(req,res)=>{
   const order=(await sql`SELECT id,user_id,order_number,total_amount,contact_email,notification_destination,payment_method,payment_status,status FROM orders WHERE id=${req.params.id}`)[0];
   if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
   if(order.payment_status==='PAID')return res.status(409).json({error:'Order is already paid.'});
-  if(order.status==='CANCELLED')return res.status(409).json({error:'Cancelled orders cannot be paid.'});
+  if(['CANCELLED','CANCEL_REVIEW','RETURN_REVIEW','RETURNED'].includes(order.status))return res.status(409).json({error:'Orders in cancellation or return processing cannot be paid.'});
   const configuredSuccessUrl=process.env.PAYMENT_SUCCESS_URL,cancelUrl=process.env.PAYMENT_CANCEL_URL;
   if(!configuredSuccessUrl||!cancelUrl)throw Object.assign(new Error('Payment return URLs are not configured.'),{code:'STRIPE_CONFIG_MISSING'});
   const successUrl=configuredSuccessUrl.includes('{CHECKOUT_SESSION_ID}')?configuredSuccessUrl:`${configuredSuccessUrl}${configuredSuccessUrl.includes('?')?'&':'?'}session_id={CHECKOUT_SESSION_ID}`;

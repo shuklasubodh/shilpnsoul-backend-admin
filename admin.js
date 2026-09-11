@@ -763,6 +763,8 @@ export default async function handler(request, response) {
         const requiredFields = ['first_name', 'last_name', 'email', 'password_hash', 'country_code', 'phone', 'whatsapp_number', 'role', 'is_active']
         const missingFields = requiredFields.filter((field) => body[field] === undefined || body[field] === '')
         if (missingFields.length) return json(response, 400, { error: `Missing required fields: ${missingFields.join(', ')}.` })
+        const duplicatePhone = await sql.query('SELECT id FROM users WHERE phone = $1 LIMIT 1', [body.phone])
+        if (duplicatePhone.length) return json(response, 409, { error: 'A user with this SMS phone number already exists.' })
       }
       const columns = resource.columns.filter((column) => availableColumns.includes(column) && body[column] !== undefined && body[column] !== '')
       if (!columns.length) return json(response, 400, { error: 'At least one valid field is required.' })

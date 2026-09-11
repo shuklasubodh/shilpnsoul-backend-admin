@@ -3,7 +3,14 @@ import sql from'./db.js';
 import{authenticate,admin,isAdmin,hashPassword}from'./auth.js';
 import{emailPattern,normalizeCountryCode,notFound,page,phoneWithCountryCode,userColumns}from'./utils.js';
 
-const router=Router();router.use(authenticate);
+const router=Router();
+router.get('/phone-availability',async(req,res)=>{
+  const countryCode=normalizeCountryCode(req.query.country_code||'+65'),phone=phoneWithCountryCode(countryCode,req.query.phone);
+  if(!countryCode||!phone)return res.status(400).json({error:'Enter a valid country calling code and phone number.'});
+  const existing=(await sql`SELECT id FROM users WHERE phone=${phone} LIMIT 1`)[0];
+  return res.json({available:!existing,phone});
+});
+router.use(authenticate);
 router.post('/',admin,async(req,res)=>{
   const{first_name,last_name}=req.body,email=String(req.body.email||'').trim().toLowerCase(),countryCode=normalizeCountryCode(req.body.country_code),phone=phoneWithCountryCode(countryCode,req.body.phone),whatsapp=phoneWithCountryCode(countryCode,req.body.whatsapp_number),password=String(req.body.password||req.body.password_hash||''),role=String(req.body.role||'CUSTOMER').toUpperCase(),active=req.body.is_active??true,preferred=String(req.body.preferred_notification_channel||'EMAIL').toUpperCase(),returnDays=Number(req.body.return_window_days??2);
   if(!first_name||!last_name||!emailPattern.test(email)||!countryCode||!phone||!whatsapp||password.length<12||!['ADMIN','CUSTOMER'].includes(role)||typeof active!=='boolean'||!['EMAIL','SMS','WHATSAPP'].includes(preferred)||!Number.isInteger(returnDays)||returnDays<0||returnDays>365)return res.status(400).json({error:'Invalid user fields, notification preference, or return window.'});

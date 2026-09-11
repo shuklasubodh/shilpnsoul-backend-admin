@@ -12,6 +12,8 @@ router.post('/auth/register',async(req,res)=>{
     const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${proof.verification_id} AND channel=${channel} AND destination=${destination} AND purpose='REGISTRATION' AND user_id IS NULL AND verified_at IS NOT NULL`)[0];
     if(!challenge)return res.status(403).json({error:`${channel} verification is incomplete.`});
   }
+  const duplicatePhone=(await sql`SELECT id FROM users WHERE phone=${phone} LIMIT 1`)[0];
+  if(duplicatePhone)return res.status(409).json({error:'A user with this SMS phone number already exists.'});
   const hash=await hashPassword(password);
   const user=(await sql.query(`INSERT INTO users(first_name,last_name,email,password_hash,country_code,phone,whatsapp_number,role,is_active,email_verified_at,phone_verified_at,whatsapp_verified_at,preferred_notification_channel) VALUES($1,$2,$3,$4,$5,$6,$7,'CUSTOMER',TRUE,NOW(),NOW(),NOW(),$8) RETURNING ${userColumns}`,[firstName,lastName,email,hash,countryCode,phone,whatsappNumber,preferredChannel]))[0];
   return res.status(201).json({token:tokenFor(user),user});

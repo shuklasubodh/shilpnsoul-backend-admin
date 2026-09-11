@@ -48,11 +48,6 @@ const OrderSummaryEmail=({order,items})=>h(Frame,{preview:`Order ${order.order_n
   h(Heading,{as:'h2',style:{fontSize:'18px',margin:'24px 0 8px'}},'Delivery address'),
   h(Text,{style:{fontSize:'14px',lineHeight:'1.6',whiteSpace:'pre-line'}},order.shipping_address));
 
-const ContactEmail=({subject,message,customer})=>h(Frame,{preview:`Storefront enquiry: ${subject}`,title:'New storefront enquiry'},
-  h(Text,{style:{color:colors.muted,fontSize:'13px',margin:'0 0 8px'}},customer?`From customer ${customer}`:'From a storefront visitor'),
-  h(Heading,{as:'h2',style:{fontSize:'18px',margin:'18px 0 8px'}},subject),
-  h(Text,{style:{fontSize:'14px',lineHeight:'1.7',whiteSpace:'pre-wrap'}},message));
-
 const sendEmail=async({to,subject,element,text,idempotencyKey,tags})=>{
   const html=await render(element);
   const result=await resendClient().emails.send({from:fromAddress(),to:[to],subject,html,text,tags},{idempotencyKey});
@@ -64,12 +59,6 @@ export const sendOtpEmail=({to,code,purpose,verificationId,expiresMinutes=10})=>
   to,subject:`Your Shilp & Soul verification code`,element:h(OtpEmail,{code,purpose,expiresMinutes}),
   text:`Your Shilp & Soul verification code is ${code}. It expires in ${expiresMinutes} minutes. If you did not request it, ignore this email.`,
   idempotencyKey:`otp/${verificationId}`,tags:[{name:'email_type',value:'otp'}],
-});
-
-export const sendContactEmail=({subject,message,customer})=>sendEmail({
-  to:'shilpsoul26@gmail.com',subject:`Storefront: ${subject}`,element:h(ContactEmail,{subject,message,customer}),
-  text:[customer?`From customer ${customer}`:'From a storefront visitor',subject,'',message].join('\n'),
-  idempotencyKey:`contact/${crypto.randomUUID()}`,tags:[{name:'email_type',value:'contact'}],
 });
 
 export async function sendOrderSummary(order,{resend=false}={}){

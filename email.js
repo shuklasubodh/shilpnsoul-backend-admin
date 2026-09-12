@@ -48,12 +48,27 @@ const OrderSummaryEmail=({order,items})=>h(Frame,{preview:`Order ${order.order_n
   h(Heading,{as:'h2',style:{fontSize:'18px',margin:'24px 0 8px'}},'Delivery address'),
   h(Text,{style:{fontSize:'14px',lineHeight:'1.6',whiteSpace:'pre-line'}},order.shipping_address));
 
-const sendEmail=async({to,subject,element,text,idempotencyKey,tags})=>{
+const ContactEmail=({name,email,subject,message})=>h(Frame,{preview:`New customer enquiry: ${subject}`,title:'New contact form message'},
+  h(Text,{style:{fontSize:'14px',lineHeight:'1.6'}},`From: ${name || 'Storefront visitor'} (${email})`),
+  h(Heading,{as:'h2',style:{fontSize:'18px',margin:'24px 0 8px'}},subject),
+  h(Text,{style:{fontSize:'14px',lineHeight:'1.7',whiteSpace:'pre-wrap'}},message));
+
+const sendEmail=async({to,subject,element,text,idempotencyKey,tags,replyTo})=>{
   const html=await render(element);
-  const result=await resendClient().emails.send({from:fromAddress(),to:[to],subject,html,text,tags},{idempotencyKey});
+  const result=await resendClient().emails.send({from:fromAddress(),to:[to],subject,html,text,tags,replyTo},{idempotencyKey});
   if(result.error)throw Object.assign(new Error(result.error.message||'Resend rejected the email.'),{statusCode:result.error.statusCode||400});
   return result.data;
 };
+
+export const sendContactMessage=({name,email,subject,message,requestId})=>sendEmail({
+  to:process.env.CONTACT_EMAIL_TO||'shilpsoul26@gmail.com',
+  subject:`Storefront enquiry: ${subject}`,
+  element:h(ContactEmail,{name,email,subject,message}),
+  text:[`From: ${name || 'Storefront visitor'} <${email}>`,`Subject: ${subject}`,'',message].join('\n'),
+  idempotencyKey:`contact/${requestId}`,
+  tags:[{name:'email_type',value:'contact'}],
+  replyTo:email,
+});
 
 export const sendOtpEmail=({to,code,purpose,verificationId,expiresMinutes=10})=>sendEmail({
   to,subject:`Your Shilp & Soul verification code`,element:h(OtpEmail,{code,purpose,expiresMinutes}),

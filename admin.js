@@ -18,8 +18,8 @@ const resources = {
   },
   products: {
     table: 'products',
-    columns: ['name', 'slug', 'sku', 'category_id', 'description', 'price', 'stock_quantity', 'image_url', 'is_active'],
-    publicColumns: ['id', 'name', 'slug', 'sku', 'category_id', 'description', 'price', 'stock_quantity', 'image_url', 'is_active', 'created_at', 'updated_at'],
+    columns: ['name', 'slug', 'sku', 'category_id', 'description', 'price', 'stock_quantity', 'image_url', 'is_active', 'optimize_for_mobile'],
+    publicColumns: ['id', 'name', 'slug', 'sku', 'category_id', 'description', 'price', 'stock_quantity', 'image_url', 'is_active', 'optimize_for_mobile', 'created_at', 'updated_at'],
     searchColumns: ['name', 'slug', 'sku', 'description'],
     responseKey: 'product',
   },
@@ -607,7 +607,7 @@ export default async function handler(request, response) {
       if (categories.length > 500 || products.length > 2000) return json(response, 400, { error: 'A single upload is limited to 500 categories and 2,000 products.' })
 
       const invalidCategory = categories.find((item) => !item?.name || !item?.slug)
-      const invalidProduct = products.find((item) => !item?.name || !item?.slug || !item?.sku || !item?.category_slug || Number(item.price) < 0 || Number(item.stock_quantity) < 0)
+      const invalidProduct = products.find((item) => !item?.name || !item?.slug || !item?.sku || !item?.category_slug || Number(item.price) < 0 || Number(item.stock_quantity) < 0 || item.optimize_for_mobile === false)
       if (invalidCategory || invalidProduct) return json(response, 400, { error: 'The upload contains missing or invalid required fields.' })
 
       const categoryIds = new Map()
@@ -759,6 +759,7 @@ export default async function handler(request, response) {
 
     if (request.method === 'POST' && !id) {
       const body = normalizedResourceBody(resourceName, request.body || {})
+      if (resourceName === 'products' && body.optimize_for_mobile === false) return json(response, 400, { error: 'Mobile image optimization is required for products.' })
       if (resourceName === 'users') {
         const requiredFields = ['first_name', 'last_name', 'email', 'password_hash', 'country_code', 'phone', 'whatsapp_number', 'role', 'is_active']
         const missingFields = requiredFields.filter((field) => body[field] === undefined || body[field] === '')
@@ -779,6 +780,7 @@ export default async function handler(request, response) {
 
     if (request.method === 'PUT' && id) {
       const body = normalizedResourceBody(resourceName, request.body || {})
+      if (resourceName === 'products' && body.optimize_for_mobile === false) return json(response, 400, { error: 'Mobile image optimization is required for products.' })
       if (resourceName === 'orders' && body.status !== undefined) {
         const status = String(body.status).toUpperCase()
         const allowed = ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED']

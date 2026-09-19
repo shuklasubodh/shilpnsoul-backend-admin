@@ -12,6 +12,7 @@ import productDescriptions from'./productDescriptions.js';
 import adminApi from'./admin.js';
 import marketing from'./marketing.js';
 import contact from'./contact.js';
+import imageOptimization from './imageOptimization.js';
 
 const defaultOrigins='http://localhost:5173,https://shilnsoul-react-admin.vercel.app,https://shilpnsoul-react-fe.vercel.app,https://shilpnsoul.com,https://www.shilpnsoul.com';
 
@@ -30,6 +31,7 @@ app.get('/api/health',async(req,res)=>{await sql`SELECT 1`;res.json({status:'ok'
 app.use('/api',login);
 app.use('/api',marketing);
 app.use('/api',contact);
+app.use('/api',imageOptimization);
 app.use('/api',notifications);
 app.use('/api',whatsapp);
 app.use('/api',productDescriptions);

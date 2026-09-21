@@ -36,6 +36,7 @@ export const sendNotificationSummary=async(order,{resend=false}={})=>{
 const verifiedNotification=async(req,user)=>{
   const requestedChannel=String(req.body.notification_channel||user?.preferred_notification_channel||'').toUpperCase();
   const email=String(req.body.contact_email||user?.email||'').trim().toLowerCase();
+  if(!email)throw Object.assign(new Error('Email address is required for checkout.'),{status:400});
   const channel=resolveNotificationChannel({customer:Boolean(user),email,requestedChannel,preferredChannel:user?.preferred_notification_channel});
   const destination=channel==='EMAIL'?email:channel==='WHATSAPP'?normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_whatsapp||user?.whatsapp_number):normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_phone||user?.phone);
   if(!notificationChannels.includes(channel)||!destination)throw Object.assign(new Error('Select and confirm an email, SMS, or WhatsApp notification channel.'),{status:400});

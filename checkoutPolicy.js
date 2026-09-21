@@ -2,7 +2,7 @@ export const notificationChannels=['EMAIL','SMS','WHATSAPP'];
 
 export const resolveNotificationChannel=({customer,email,requestedChannel,preferredChannel})=>{
   const requested=String(requestedChannel||preferredChannel||'').toUpperCase();
-  return !customer&&email?'EMAIL':requested;
+  return requested||(!customer&&email?'EMAIL':'');
 };
 
 export const verificationMatches=({claims,channel,destination,purpose='CHECKOUT'})=>Boolean(

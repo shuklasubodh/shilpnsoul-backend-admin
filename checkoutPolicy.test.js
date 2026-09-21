@@ -2,8 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {resolveNotificationChannel,returnDeadlineOpen,verificationMatches} from './checkoutPolicy.js';
 
-test('guest email takes precedence when supplied',()=>{
-  assert.equal(resolveNotificationChannel({customer:false,email:'guest@example.com',requestedChannel:'SMS'}),'EMAIL');
+test('guest selection is honored when a mandatory email is also supplied',()=>{
+  assert.equal(resolveNotificationChannel({customer:false,email:'guest@example.com',requestedChannel:'SMS'}),'SMS');
+});
+
+test('guest defaults to email when no notification channel is requested',()=>{
+  assert.equal(resolveNotificationChannel({customer:false,email:'guest@example.com'}),'EMAIL');
 });
 
 test('customer preference is honored instead of forcing email',()=>{

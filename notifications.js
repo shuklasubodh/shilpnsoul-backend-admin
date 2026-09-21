@@ -15,6 +15,7 @@ const safeEqual=(left,right)=>{const a=Buffer.from(left),b=Buffer.from(right);re
 router.post('/notification-verifications/request',optionalAuthenticate,async(req,res)=>{
   const channel=String(req.body.channel||'').toUpperCase(),purpose=String(req.body.purpose||'').toUpperCase(),destination=normalize(channel,req.body.destination);
   if(!['REGISTRATION','CHECKOUT'].includes(purpose))return res.status(400).json({error:'Invalid verification purpose.'});
+  if(purpose==='REGISTRATION'&&process.env.REGISTRATION_ENABLED!=='true')return res.status(403).json({error:'New account registration is currently unavailable.'});
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||(channel==='EMAIL'?!emailPattern.test(destination):!destination))return res.status(400).json({error:'A valid email or mobile notification destination is required.'});
   if(!req.user&&purpose==='CHECKOUT'){
     const existing=channel==='EMAIL'

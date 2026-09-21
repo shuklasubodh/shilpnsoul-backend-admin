@@ -1,6 +1,8 @@
 import{Router}from'express';import sql from'./db.js';import{authenticate,hashPassword,tokenFor,verifyNotificationToken,verifyPassword}from'./auth.js';import{emailPattern,normalizeCountryCode,phoneWithCountryCode,userColumns}from'./utils.js';import{normalizeWhatsAppNumber}from'./whatsapp.js';
 const router=Router();
+const registrationEnabled=process.env.REGISTRATION_ENABLED==='true';
 router.post('/auth/register',async(req,res)=>{
+  if(!registrationEnabled)return res.status(403).json({error:'New account registration is currently unavailable.'});
   const firstName=String(req.body.first_name||'').trim(),lastName=String(req.body.last_name||'').trim(),email=String(req.body.email||'').trim().toLowerCase(),countryCode=normalizeCountryCode(req.body.country_code||'+65'),phone=normalizeWhatsAppNumber(phoneWithCountryCode(countryCode,req.body.phone)),whatsappNumber=normalizeWhatsAppNumber(req.body.whatsapp_number),password=String(req.body.password||'');
   const preferredChannel=String(req.body.preferred_notification_channel||'EMAIL').toUpperCase();
   if(!firstName||!lastName||!emailPattern.test(email)||!phone||!whatsappNumber||password.length<12||!['EMAIL','SMS','WHATSAPP'].includes(preferredChannel))return res.status(400).json({error:'Name, email, SMS number, WhatsApp number, notification preference, and a password of at least 12 characters are required.'});

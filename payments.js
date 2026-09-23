@@ -4,6 +4,7 @@ import sql from './db.js';
 import {admin,optionalAuthenticate,verifyOrderAccessToken} from './auth.js';
 import {isId,notFound} from './utils.js';
 import {sendNotificationSummary} from './orders.js';
+import {releaseExpiredReservations,releaseInventoryReservation,reservationMinutes} from './inventoryReservations.js';
 
 let client;
 let accountVerification;
@@ -48,21 +49,29 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
   const session=event.data.object;
   if(['checkout.session.completed','checkout.session.async_payment_succeeded'].includes(event.type)){
     const orderId=session.metadata?.order_id;
-    const order=isId(orderId)?(await sql`SELECT id,total_amount,payment_status FROM orders WHERE id=${orderId}`)[0]:null;
+    const order=isId(orderId)?(await sql`SELECT id,total_amount,payment_status,inventory_reserved_until,inventory_released_at FROM orders WHERE id=${orderId}`)[0]:null;
     const payment=order?(await sql`SELECT id FROM payments WHERE order_id=${order.id} AND stripe_checkout_session_id=${session.id}`)[0]:null;
     const valid=order&&payment&&session.mode==='payment'&&session.payment_status==='paid'&&
       session.currency===currency()&&session.amount_total===minorUnits(order.total_amount);
     if(valid){
-      await sql`UPDATE payments SET status='PAID',stripe_payment_intent_id=${String(session.payment_intent||'')},paid_at=NOW(),updated_at=NOW() WHERE order_id=${order.id} AND stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
       const paidEvents=await sql`
         WITH paid AS (
           UPDATE orders SET payment_status='PAID',status=CASE WHEN status='PENDING' THEN 'CONFIRMED' ELSE status END,updated_at=NOW()
-          WHERE id=${order.id} AND payment_status<>'PAID' RETURNING id,status
+          WHERE id=${order.id} AND payment_status<>'PAID' AND inventory_released_at IS NULL AND inventory_reserved_until>NOW()
+          RETURNING id,status
         )
         INSERT INTO order_events(order_id,event_type,from_payment_status,to_payment_status,to_status,actor_type,metadata)
         SELECT id,'PAYMENT_STATUS_CHANGED',${order.payment_status},'PAID',status,'SYSTEM',jsonb_build_object('provider','STRIPE','stripe_event_id',${event.id}::text) FROM paid
+        RETURNING order_id
       `;
-      await ensurePaidOrderNotification(order.id);
+      if(paidEvents.length){
+        await sql`UPDATE payments SET status='PAID',stripe_payment_intent_id=${String(session.payment_intent||'')},paid_at=NOW(),updated_at=NOW() WHERE order_id=${order.id} AND stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
+        await ensurePaidOrderNotification(order.id);
+      }else if(session.payment_intent){
+        await stripe.refunds.create({payment_intent:String(session.payment_intent),reason:'requested_by_customer'},{idempotencyKey:'expired-reservation-'+order.id+'-'+session.id});
+        await sql`UPDATE payments SET status='FAILED',updated_at=NOW() WHERE order_id=${order.id} AND stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
+        await releaseInventoryReservation(order.id,'LATE_PAYMENT_REFUNDED');
+      }
     }
   }else if(event.type==='checkout.session.async_payment_failed'||event.type==='checkout.session.expired'){
     await sql`UPDATE payments SET status=${event.type.endsWith('expired')?'EXPIRED':'FAILED'},updated_at=NOW() WHERE stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
@@ -75,8 +84,10 @@ router.use(optionalAuthenticate);
 router.get('/checkout-sessions/:sessionId/result',async(req,res)=>{
   const sessionId=String(req.params.sessionId||'').trim();
   if(!/^cs_(?:test_|live_)?[A-Za-z0-9]+$/.test(sessionId))return res.status(400).json({error:'Invalid checkout session.'});
+  await releaseExpiredReservations();
   const result=(await sql`SELECT o.id,o.order_number,o.status,o.payment_status,o.notification_channel FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.stripe_checkout_session_id=${sessionId} ORDER BY p.id DESC LIMIT 1`)[0];
   if(result?.payment_status==='PAID')await ensurePaidOrderNotification(result.id);
+  if(result?.payment_status!=='PAID')delete result.order_number;
   if(result)delete result.id;
   return result?res.json(result):notFound(res,'Checkout session');
 });
@@ -85,10 +96,12 @@ const canAccessOrder=(req,order)=>{
   try{const claims=verifyOrderAccessToken(req.get('x-order-access-token'));return claims.type==='guest-order'&&String(claims.sub)===String(order.id)&&claims.destination===order.notification_destination}catch{return false}
 };
 router.post('/orders/:id/checkout',async(req,res)=>{
+  await releaseExpiredReservations();
   if(!isId(req.params.id))return notFound(res,'Order');
-  const order=(await sql`SELECT id,user_id,order_number,total_amount,contact_email,notification_destination,payment_method,payment_status,status FROM orders WHERE id=${req.params.id}`)[0];
+  const order=(await sql`SELECT id,user_id,order_number,total_amount,contact_email,notification_destination,payment_method,payment_status,status,inventory_reserved_until,inventory_released_at FROM orders WHERE id=${req.params.id}`)[0];
   if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
   if(order.payment_status==='PAID')return res.status(409).json({error:'Order is already paid.'});
+  if(order.inventory_released_at||!order.inventory_reserved_until||new Date(order.inventory_reserved_until)<=new Date())return res.status(409).json({error:'Your inventory reservation has expired. Return to your bag to check current availability.',code:'RESERVATION_EXPIRED'});
   if(['CANCELLED','CANCEL_REVIEW','RETURN_REVIEW','RETURNED'].includes(order.status))return res.status(409).json({error:'Orders in cancellation or return processing cannot be paid.'});
   const configuredSuccessUrl=process.env.PAYMENT_SUCCESS_URL,cancelUrl=process.env.PAYMENT_CANCEL_URL;
   if(!configuredSuccessUrl||!cancelUrl)throw Object.assign(new Error('Payment return URLs are not configured.'),{code:'STRIPE_CONFIG_MISSING'});
@@ -108,20 +121,38 @@ router.post('/orders/:id/checkout',async(req,res)=>{
     ...(customerEmail?{customer_email:customerEmail}:{}),
     client_reference_id:String(order.id),
     metadata:{order_id:String(order.id),order_number:order.order_number,user_id:String(req.user?.id||'guest')},
-    line_items:[{quantity:1,price_data:{currency:currency(),unit_amount:minorUnits(order.total_amount),product_data:{name:`Order ${order.order_number}`}}}],
+    line_items:[{quantity:1,price_data:{currency:currency(),unit_amount:minorUnits(order.total_amount),product_data:{name:'Shilp & Soul purchase'}}}],
     success_url:successUrl,
     cancel_url:cancelUrl,
   },{idempotencyKey:`order-${order.id}-checkout-${attempts+1}`});
   await sql`INSERT INTO payments(order_id,user_id,provider,method,status,amount,currency,stripe_checkout_session_id) VALUES(${order.id},${req.user?.id||null},'STRIPE','ONLINE','PENDING',${order.total_amount},${currency().toUpperCase()},${session.id}) ON CONFLICT(stripe_checkout_session_id) DO NOTHING`;
   await sql`UPDATE orders SET payment_method='STRIPE',updated_at=NOW() WHERE id=${order.id}`;
-  return res.status(201).json({checkout_url:session.url,session_id:session.id});
+  return res.status(201).json({checkout_url:session.url,session_id:session.id,reservation_minutes:reservationMinutes(),reserved_until:order.inventory_reserved_until});
+});
+
+router.post('/orders/:id/release',async(req,res)=>{
+  if(!isId(req.params.id))return notFound(res,'Order');
+  const order=(await sql`SELECT id,user_id,notification_destination,payment_status FROM orders WHERE id=${req.params.id}`)[0];
+  if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
+  if(order.payment_status==='PAID')return res.status(409).json({error:'Paid orders cannot be released.'});
+  const sessions=await sql`SELECT stripe_checkout_session_id FROM payments WHERE order_id=${order.id} AND status='PENDING'`;
+  const released=await releaseInventoryReservation(order.id,'CUSTOMER_LOGOUT');
+  if(released){
+    const stripe=await verifiedStripeClient();
+    for(const payment of sessions){try{await stripe.checkout.sessions.expire(payment.stripe_checkout_session_id)}catch(error){if(error.code!=='checkout_session_not_open')console.error('Stripe session expiry failed',{orderId:order.id,error:error.message})}}
+    await sql`UPDATE payments SET status='EXPIRED',updated_at=NOW() WHERE order_id=${order.id} AND status='PENDING'`;
+  }
+  return res.json({released:Boolean(released)});
 });
 
 router.get('/orders/:id/payment',async(req,res)=>{
+  await releaseExpiredReservations();
   const order=(await sql`SELECT id,user_id,order_number,status,notification_channel,notification_destination,payment_method,payment_status FROM orders WHERE id=${req.params.id}`)[0];
   if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
   const payment=(await sql`SELECT provider,method,status,amount,currency,paid_at,created_at,updated_at FROM payments WHERE order_id=${order.id} ORDER BY id DESC LIMIT 1`)[0]||null;
-  return res.json({order_id:order.id,payment_method:order.payment_method,payment_status:order.payment_status,payment});
+  const result={order_id:order.id,payment_method:order.payment_method,payment_status:order.payment_status,status:order.status,notification_channel:order.notification_channel,payment};
+  if(order.payment_status==='PAID')result.order_number=order.order_number;
+  return res.json(result);
 });
 
 router.put('/orders/:id/cash',admin,async(req,res)=>{

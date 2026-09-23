@@ -7,6 +7,7 @@ import {normalizeWhatsAppNumber,sendOrderSummaryWhatsApp} from './whatsapp.js';
 import {sendOrderSummarySms} from './sms.js';
 import {notFound} from './utils.js';
 import {notificationChannels,resolveNotificationChannel,returnDeadlineOpen,verificationMatches} from './checkoutPolicy.js';
+import {releaseExpiredReservations,reservationMinutes} from './inventoryReservations.js';
 
 const router=Router();
 
@@ -55,6 +56,7 @@ const verifiedNotification=async(req,user)=>{
 };
 
 const createOrder=async(req,res,user=null)=>{
+  await releaseExpiredReservations();
   const {shipping_name,shipping_phone,shipping_address}=req.body;
   const items=req.body.items;
   const paymentMethod=String(req.body.payment_method||'CASH').toUpperCase();
@@ -109,8 +111,8 @@ const createOrder=async(req,res,user=null)=>{
       UPDATE products p SET stock_quantity=p.stock_quantity-r.quantity,updated_at=NOW()
       FROM requested r,eligible e WHERE e.ok AND r.product_color_id IS NULL AND p.id=r.product_id RETURNING p.id
     ), new_order AS (
-      INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,contact_whatsapp,payment_method,payment_status,notification_channel,notification_destination,return_window_days)
-      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$15,$10,'UNPAID',$11,$12,$14 FROM eligible WHERE ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
+      INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,contact_whatsapp,payment_method,payment_status,notification_channel,notification_destination,return_window_days,inventory_reserved_at,inventory_reserved_until)
+      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$15,$10,'UNPAID',$11,$12,$14,NOW(),NOW()+($16::int*INTERVAL '1 minute') FROM eligible WHERE ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
       RETURNING *
     ), new_items AS (
       INSERT INTO order_items(order_id,product_id,product_color_id,color,product_name,quantity,unit_price,subtotal)
@@ -119,13 +121,15 @@ const createOrder=async(req,res,user=null)=>{
       INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id)
       SELECT id,'ORDER_CREATED','PENDING','UNPAID',$13,$2 FROM new_order RETURNING id
     ) SELECT * FROM new_order WHERE (SELECT COUNT(*) FROM new_items)>0 AND (SELECT COUNT(*) FROM new_event)>0
-  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,notification.channel,notification.destination,user?'CUSTOMER':'GUEST',returnWindowDays,contactWhatsapp]);
+  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,notification.channel,notification.destination,user?'CUSTOMER':'GUEST',returnWindowDays,contactWhatsapp,reservationMinutes()]);
   const order=created[0];
   if(!order)return res.status(409).json({error:'Insufficient stock for one or more selected products.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
   order.notification=paymentMethod==='STRIPE'?{status:'PENDING_PAYMENT'}:await sendNotificationSummary(order);
   if(!user)order.order_access_token=orderAccessTokenFor(order);
-  return res.status(201).json(order);
+  const response={...order,reservation_minutes:reservationMinutes()};
+  if(response.payment_status!=='PAID')delete response.order_number;
+  return res.status(201).json(response);
 };
 
 const resendOrderSummary=async(res,order)=>{
@@ -274,7 +278,7 @@ router.get('/orders/:id/notifications/status',async(req,res)=>{
   return orderNotificationStatus(res,{...order,notification_channel:channel});
 });
 
-router.get('/orders',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELECT * FROM orders ORDER BY id DESC`:await sql`SELECT * FROM orders WHERE user_id=${req.user.id} AND customer_hidden_at IS NULL ORDER BY id DESC`;res.set('X-Total-Count',rows.length);return res.json(rows)});
+router.get('/orders',async(req,res)=>{const rows=isAdmin(req.user)?await sql`SELECT * FROM orders ORDER BY id DESC`:await sql`SELECT * FROM orders WHERE user_id=${req.user.id} AND customer_hidden_at IS NULL AND payment_status='PAID' ORDER BY id DESC`;res.set('X-Total-Count',rows.length);return res.json(rows)});
 router.get('/orders/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&(String(order.user_id)!==String(req.user.id)||order.customer_hidden_at))return notFound(res,'Order');order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;return res.json(order)});
 router.put('/orders/:id',admin,async(req,res)=>{
   const status=String(req.body.status||'').toUpperCase();

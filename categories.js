@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import sql from './db.js'
+import { releaseExpiredReservations } from './inventoryReservations.js'
 import { authenticate, admin } from './auth.js'
 import { notFound, page } from './utils.js'
 
@@ -75,6 +76,7 @@ router.get('/banners', async (req, res) => {
 
 for (const [name, columns] of Object.entries(resources)) {
   router.get(`/${name}`, async (req, res) => {
+    if (name === 'products') await releaseExpiredReservations()
     const p = page(req.query)
     const count = await sql.query(`SELECT COUNT(*)::int count FROM ${name} WHERE is_active=true`)
     let rows = await sql.query(`SELECT * FROM ${name} WHERE is_active=true ORDER BY id LIMIT $1 OFFSET $2`, [p.limit, p.start])

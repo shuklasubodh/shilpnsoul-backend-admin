@@ -7,7 +7,7 @@ import { notFound, page } from './utils.js'
 const router = Router()
 const resources = {
   categories: ['name', 'slug', 'description', 'display_order', 'is_active'],
-  products: ['category_id', 'sku', 'name', 'slug', 'description', 'price', 'stock_quantity', 'image_url', 'is_active'],
+  products: ['category_id', 'sku', 'name', 'slug', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active'],
 }
 
 const legacyImages = (value) => {
@@ -49,7 +49,7 @@ const withProductDetails = async (rows, req) => {
   if (!rows.length) return rows
   const ids = rows.map((row) => row.id)
   const [colors, descriptions] = await Promise.all([
-    sql.query('SELECT id,product_id,color,quantity FROM product_color WHERE product_id=ANY($1) ORDER BY product_id,color,id', [ids]),
+    sql.query('SELECT id,product_id,color,size,quantity FROM product_color WHERE product_id=ANY($1) ORDER BY product_id,color,size,id', [ids]),
     sql.query('SELECT * FROM product_description WHERE product_id=ANY($1)', [ids]),
   ])
   const colorsByProduct = new Map()
@@ -135,16 +135,16 @@ router.get('/products/:id/colors', authenticate, admin, async (req, res) => {
 router.post('/product-colors', authenticate, admin, async (req, res) => {
   const quantity = Number(req.body.quantity)
   if (!Number.isInteger(quantity) || quantity < 0 || !String(req.body.color || '').trim()) return res.status(400).json({ error: 'Color and a non-negative whole-number quantity are required.' })
-  const rows = await sql.query('INSERT INTO product_color(product_id,color,quantity) VALUES($1,$2,$3) RETURNING *', [req.body.product_id, String(req.body.color).trim(), quantity])
+  const rows = await sql.query('INSERT INTO product_color(product_id,color,size,quantity) VALUES($1,$2,$3,$4) RETURNING *', [req.body.product_id, String(req.body.color).trim(), String(req.body.size || '').trim(), quantity])
   return res.status(201).json(rows[0])
 })
 
 router.put('/product-colors/:id', authenticate, admin, async (req, res) => {
   const old = (await sql.query('SELECT * FROM product_color WHERE id=$1', [req.params.id]))[0]
   if (!old) return notFound(res, 'Product color')
-  const quantity = Number(req.body.quantity ?? old.quantity), color = String(req.body.color ?? old.color).trim()
+  const quantity = Number(req.body.quantity ?? old.quantity), color = String(req.body.color ?? old.color).trim(), size = String(req.body.size ?? old.size ?? '').trim()
   if (!Number.isInteger(quantity) || quantity < 0 || !color) return res.status(400).json({ error: 'Color and a non-negative whole-number quantity are required.' })
-  const rows = await sql.query('UPDATE product_color SET color=$1,quantity=$2,updated_at=NOW() WHERE id=$3 RETURNING *', [color, quantity, req.params.id])
+  const rows = await sql.query('UPDATE product_color SET color=$1,size=$2,quantity=$3,updated_at=NOW() WHERE id=$4 RETURNING *', [color, size, quantity, req.params.id])
   return res.json(rows[0])
 })
 

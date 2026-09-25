@@ -18,9 +18,9 @@ const resources = {
   },
   products: {
     table: 'products',
-    columns: ['name', 'slug', 'sku', 'category_id', 'description', 'price', 'stock_quantity', 'image_url', 'is_active', 'optimize_for_mobile'],
-    publicColumns: ['id', 'name', 'slug', 'sku', 'category_id', 'description', 'price', 'stock_quantity', 'image_url', 'is_active', 'optimize_for_mobile', 'created_at', 'updated_at'],
-    searchColumns: ['name', 'slug', 'sku', 'description'],
+    columns: ['name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'optimize_for_mobile'],
+    publicColumns: ['id', 'name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'optimize_for_mobile', 'created_at', 'updated_at'],
+    searchColumns: ['name', 'slug', 'sku', 'description', 'place', 'dimension'],
     responseKey: 'product',
   },
   categories: {
@@ -53,9 +53,9 @@ const resources = {
   },
   'product-colors': {
     table: 'product_color',
-    columns: ['product_id', 'color', 'quantity'],
-    publicColumns: ['id', 'product_id', 'color', 'quantity', 'created_at', 'updated_at'],
-    searchColumns: ['color'],
+    columns: ['product_id', 'color', 'size', 'quantity'],
+    publicColumns: ['id', 'product_id', 'color', 'size', 'quantity', 'created_at', 'updated_at'],
+    searchColumns: ['color', 'size'],
     responseKey: 'product_color',
   },
 }
@@ -651,23 +651,23 @@ export default async function handler(request, response) {
         const resolvedSlug = await uniqueProductSlug(sql, product.slug, normalizedSku, existing[0]?.id)
         const values = [
           String(product.name).trim(), resolvedSlug, normalizedSku, categoryId,
-          String(product.description || ''), Number(product.price), Math.floor(Number(product.stock_quantity)),
+          String(product.description || ''), String(product.place || ''), String(product.dimension || ''), Number(product.price), Math.floor(Number(product.stock_quantity)),
           JSON.stringify(incomingImages), product.is_active !== false,
         ]
         let productId
         let mergedImages = incomingImages
         if (existing.length) {
           mergedImages = [...new Set([...productImages(existing[0].image_url), ...incomingImages])]
-          values[7] = JSON.stringify(mergedImages)
+          values[9] = JSON.stringify(mergedImages)
           await sql.query(
-            'UPDATE products SET name = $1, slug = $2, sku = $3, category_id = $4, description = $5, price = $6, stock_quantity = $7, image_url = $8, is_active = $9, updated_at = NOW() WHERE id = $10',
+            'UPDATE products SET name = $1, slug = $2, sku = $3, category_id = $4, description = $5, place = $6, dimension = $7, price = $8, stock_quantity = $9, image_url = $10, is_active = $11, updated_at = NOW() WHERE id = $12',
             [...values, existing[0].id],
           )
           productId = existing[0].id
           productResult.updated += 1
         } else {
           const created = await sql.query(
-            'INSERT INTO products (name, slug, sku, category_id, description, price, stock_quantity, image_url, is_active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id',
+            'INSERT INTO products (name, slug, sku, category_id, description, place, dimension, price, stock_quantity, image_url, is_active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id',
             values,
           )
           productId = created[0].id

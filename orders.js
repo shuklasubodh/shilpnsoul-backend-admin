@@ -84,7 +84,9 @@ const createOrder=async(req,res,user=null)=>{
     requested.set(key,{product_id:product.id,product_color_id:product.product_color_id||null,quantity:(existing?.quantity||0)+quantity,product_name:product.name,color:product.color||null,unit_price:Number(product.price)});
   }
   const prepared=[...requested.values()];
-  total=prepared.reduce((sum,item)=>sum+item.unit_price*item.quantity,0);
+  const subtotal=prepared.reduce((sum,item)=>sum+item.unit_price*item.quantity,0);
+  const delivery=subtotal>=30?0:5;
+  total=subtotal+delivery;
   const number=`ORD-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
   const payload=JSON.stringify(prepared);
   const created=await sql.query(`

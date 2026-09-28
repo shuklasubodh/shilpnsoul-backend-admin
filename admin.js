@@ -1,7 +1,7 @@
 import { neon } from '@neondatabase/serverless'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { timingSafeEqual } from 'node:crypto'
 import { handleUpload } from '@vercel/blob/client'
 import { del as deleteBlob, get as getBlob, list as listBlobs, rename as renameBlob } from '@vercel/blob'
 
@@ -269,7 +269,6 @@ const databaseError = (response, error) => {
 }
 
 export default async function handler(request, response) {
-  response.setHeader('Access-Control-Allow-Origin', '*')
   response.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type,Accept,Authorization')
   response.setHeader('Access-Control-Expose-Headers', 'X-Total-Count')
@@ -277,9 +276,8 @@ export default async function handler(request, response) {
 
   const connectionString = process.env.DATABASE_URL || process.env.POSTGRES_URL
   if (!connectionString) return json(response, 500, { error: 'DATABASE_URL is not configured for this deployment.' })
-  const authSecret = process.env.ADMIN_JWT_SECRET || createHash('sha256')
-    .update(`shilpnsoul-admin:${connectionString}`)
-    .digest('hex')
+  const authSecret = String(process.env.ADMIN_JWT_SECRET || '')
+  if (authSecret.length < 32) return json(response, 503, { error: 'ADMIN_JWT_SECRET must be configured with at least 32 characters.' })
   const route = String(request.query.route || '').replace(/^\/+|\/+$/g, '')
   const [resourceName, id, ...extra] = route.split('/')
   const sql = neon(connectionString)

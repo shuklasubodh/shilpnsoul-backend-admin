@@ -1,6 +1,5 @@
 import {Router} from 'express';
 import path from 'node:path';
-import {createHash} from 'node:crypto';
 import multer from 'multer';
 import mammoth from 'mammoth';
 import ExcelJS from 'exceljs';
@@ -66,8 +65,7 @@ const validate=rows=>{
 
 const descriptionAdmin=(req,res,next)=>{
   const authorization=String(req.get('authorization')||''),token=authorization.startsWith('Bearer ')?authorization.slice(7):'';
-  const connectionString=process.env.DATABASE_URL||process.env.POSTGRES_URL;
-  const adminSecret=process.env.ADMIN_JWT_SECRET||(connectionString?createHash('sha256').update(`shilpnsoul-admin:${connectionString}`).digest('hex'):'');
+  const adminSecret=String(process.env.ADMIN_JWT_SECRET||'');
   if(token&&adminSecret){
     try{
       const session=jwt.verify(token,adminSecret,{algorithms:['HS256'],issuer:'shilpnsoul-admin',audience:'shilpnsoul-admin-web'});

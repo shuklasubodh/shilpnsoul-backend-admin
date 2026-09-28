@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import {Router} from 'express';
 import sql from './db.js';
-import {notificationTokenFor,optionalAuthenticate} from './auth.js';
+import {authSecret,notificationTokenFor,optionalAuthenticate} from './auth.js';
 import {sendOtpEmail} from './email.js';
 import {normalizeWhatsAppNumber,sendOtpWhatsApp} from './whatsapp.js';
 import {sendOtpSms,verifyOtpSms} from './sms.js';
@@ -9,7 +9,7 @@ import {emailPattern} from './utils.js';
 
 const router=Router();
 const normalize=(channel,value)=>channel==='EMAIL'?String(value||'').trim().toLowerCase():normalizeWhatsAppNumber(value);
-const codeHash=(code,destination,nonce)=>crypto.createHmac('sha256',process.env.AUTH_SECRET||process.env.DATABASE_URL||process.env.POSTGRES_URL||'').update(`${code}:${destination}:${nonce}`).digest('hex');
+const codeHash=(code,destination,nonce)=>crypto.createHmac('sha256',authSecret()).update(`${code}:${destination}:${nonce}`).digest('hex');
 const safeEqual=(left,right)=>{const a=Buffer.from(left),b=Buffer.from(right);return a.length===b.length&&crypto.timingSafeEqual(a,b)};
 
 router.post('/notification-verifications/request',optionalAuthenticate,async(req,res)=>{

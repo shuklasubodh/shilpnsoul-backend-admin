@@ -13,15 +13,34 @@ import adminApi from'./admin.js';
 import marketing from'./marketing.js';
 import contact from'./contact.js';
 import imageOptimization from './imageOptimization.js';
+import {rateLimit} from './rateLimit.js';
 
 const defaultOrigins='http://localhost:5173,https://shilnsoul-react-admin.vercel.app,https://shilpnsoul-react-fe.vercel.app,https://shilpnsoul.com,https://www.shilpnsoul.com';
 
 const normalizeOrigin=value=>String(value||'').trim().replace(/\/$/,'');
 const app=express(),origins=[...new Set(`${defaultOrigins},${process.env.CORS_ORIGINS||''}`.split(',').map(normalizeOrigin).filter(Boolean))];
 
+app.disable('x-powered-by');
+app.use((req,res,next)=>{res.set({
+  'X-Content-Type-Options':'nosniff',
+  'Referrer-Policy':'strict-origin-when-cross-origin',
+  'Permissions-Policy':'camera=(), microphone=(), geolocation=()',
+  'Content-Security-Policy':"default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+});next()});
 app.use(cors({origin:(origin,callback)=>!origin||origins.includes(normalizeOrigin(origin))?callback(null,true):callback(new Error('CORS origin denied')),exposedHeaders:['X-Total-Count']}));
 app.use('/api/payments/stripe/webhook',stripeWebhook);
 app.use(express.json({limit:'4mb',verify:(req,res,buffer)=>{if(req.originalUrl?.startsWith('/api/whatsapp/webhook'))req.rawBody=Buffer.from(buffer)}}));
+
+app.use(['/api/login','/api/auth/login'],rateLimit({scope:'customer-login',maxAttempts:5,windowSeconds:900,blockSeconds:1800,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
+app.use('/api/admin/auth/login',rateLimit({scope:'admin-login',maxAttempts:5,windowSeconds:900,blockSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
+app.use('/api/marketing',rateLimit({scope:'marketing',maxAttempts:5,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
+app.use('/api/contact',rateLimit({scope:'contact',maxAttempts:3,windowSeconds:600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
+app.use('/api/users/phone-availability',rateLimit({scope:'phone-availability',maxAttempts:10,windowSeconds:3600}));
+app.use('/api/notification-verifications/request',rateLimit({scope:'verification-request',maxAttempts:10,windowSeconds:3600}));
+app.use('/api/auth/register',rateLimit({scope:'registration',maxAttempts:5,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
+app.use('/api/orders/track',rateLimit({scope:'guest-order-track',maxAttempts:8,windowSeconds:900,value:req=>String(req.body?.orderNumber||'')}));
+app.use('/api/orders/:id/guest-actions',rateLimit({scope:'guest-order-action',maxAttempts:5,windowSeconds:3600,value:req=>req.params.id}));
+app.use('/api/payments/orders/:id/checkout',rateLimit({scope:'payment-checkout',maxAttempts:10,windowSeconds:900,value:req=>req.params.id}));
 
 app.use('/api/admin',productDescriptions);
 app.use('/api/admin',(req,res)=>{const request=Object.create(req);Object.defineProperty(request,'query',{value:{...req.query,route:String(req.path||'').replace(/^\/+|\/+$/g,'')}});return adminApi(request,res)});
@@ -44,6 +63,7 @@ app.use('/api/payments',payments);
 app.use((req,res)=>res.status(404).json({error:'Endpoint not found.'}));
 app.use((error,req,res,next)=>{if(res.headersSent)return next(error);console.error(error);
     if(error.code==='DATABASE_URL_MISSING')return res.status(503).json({error:'Database connection is not configured for this deployment.'});
+    if(error.code==='AUTH_SECRET_MISSING')return res.status(503).json({error:'Authentication security is not configured for this deployment.'});
     if(error.code==='STRIPE_CONFIG_MISSING')return res.status(503).json({error:error.message});
     if(error.code==='STRIPE_ACCOUNT_MISMATCH')return res.status(503).json({error:'Stripe account verification failed.'});
     if(error.code==='WHATSAPP_CONFIG_MISSING')return res.status(503).json({error:error.message});

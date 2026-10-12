@@ -12,6 +12,7 @@ import productDescriptions from'./productDescriptions.js';
 import adminApi from'./admin.js';
 import marketing from'./marketing.js';
 import contact from'./contact.js';
+import bootstrap,{requireStoreReady}from'./bootstrap.js';
 import imageOptimization from './imageOptimization.js';
 import {rateLimit} from './rateLimit.js';
 
@@ -38,14 +39,23 @@ app.use('/api/contact',rateLimit({scope:'contact',maxAttempts:3,windowSeconds:60
 app.use('/api/users/phone-availability',rateLimit({scope:'phone-availability',maxAttempts:10,windowSeconds:3600}));
 app.use('/api/notification-verifications/request',rateLimit({scope:'verification-request',maxAttempts:10,windowSeconds:3600}));
 app.use('/api/auth/register',rateLimit({scope:'registration',maxAttempts:5,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
+app.use('/api/auth/password-reset/request',rateLimit({scope:'password-reset-request',maxAttempts:5,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
+app.use('/api/auth/password-reset/confirm',rateLimit({scope:'password-reset-confirm',maxAttempts:8,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
+app.use('/api/auth/invitations/accept',rateLimit({scope:'invitation-accept',maxAttempts:10,windowSeconds:3600}));
+app.use('/api/admin/bootstrap/request-code',rateLimit({scope:'initial-admin-request',maxAttempts:5,windowSeconds:3600,blockSeconds:3600}));
+app.use('/api/admin/bootstrap/complete',rateLimit({scope:'initial-admin-complete',maxAttempts:8,windowSeconds:3600,blockSeconds:3600}));
 app.use('/api/orders/track',rateLimit({scope:'guest-order-track',maxAttempts:8,windowSeconds:900,value:req=>String(req.body?.orderNumber||'')}));
 app.use('/api/orders/:id/guest-actions',rateLimit({scope:'guest-order-action',maxAttempts:5,windowSeconds:3600,value:req=>req.params.id}));
 app.use('/api/payments/orders/:id/checkout',rateLimit({scope:'payment-checkout',maxAttempts:10,windowSeconds:900,value:req=>req.params.id}));
 
+app.use('/api',bootstrap);
 app.use('/api/admin',productDescriptions);
 app.use('/api/admin',(req,res)=>{const request=Object.create(req);Object.defineProperty(request,'query',{value:{...req.query,route:String(req.path||'').replace(/^\/+|\/+$/g,'')}});return adminApi(request,res)});
 
 app.get('/api/health',async(req,res)=>{await sql`SELECT 1`;res.json({status:'ok',database:'connected'})});
+
+app.post(['/api/auth/register','/api/orders','/api/orders/guest','/api/payments/orders/:id/checkout'],requireStoreReady);
+app.post('/api/notification-verifications/request',(req,res,next)=>['REGISTRATION','CHECKOUT'].includes(String(req.body?.purpose||'').toUpperCase())?requireStoreReady(req,res,next):next());
 
 app.use('/api',login);
 app.use('/api',marketing);
@@ -64,6 +74,7 @@ app.use((req,res)=>res.status(404).json({error:'Endpoint not found.'}));
 app.use((error,req,res,next)=>{if(res.headersSent)return next(error);console.error(error);
     if(error.code==='DATABASE_URL_MISSING')return res.status(503).json({error:'Database connection is not configured for this deployment.'});
     if(error.code==='AUTH_SECRET_MISSING')return res.status(503).json({error:'Authentication security is not configured for this deployment.'});
+    if(error.code==='INITIAL_ADMIN_CONFIG_MISSING')return res.status(503).json({error:'Initial administrator security is not configured for this deployment.'});
     if(error.code==='STRIPE_CONFIG_MISSING')return res.status(503).json({error:error.message});
     if(error.code==='STRIPE_ACCOUNT_MISMATCH')return res.status(503).json({error:'Stripe account verification failed.'});
     if(error.code==='WHATSAPP_CONFIG_MISSING')return res.status(503).json({error:error.message});

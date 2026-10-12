@@ -1,8 +1,15 @@
 export const notificationChannels=['EMAIL','SMS','WHATSAPP'];
 
-export const resolveNotificationChannel=({customer,email,requestedChannel,preferredChannel})=>{
-  const requested=String(requestedChannel||preferredChannel||'').toUpperCase();
-  return requested||(!customer&&email?'EMAIL':'');
+export const verificationChannelsFor=({email,phone,whatsapp})=>[
+  ...(email?['EMAIL']:[]),
+  ...(phone?['SMS']:[]),
+  ...(whatsapp?['WHATSAPP']:[]),
+];
+
+export const notificationChannelsFor=({requestedChannels=[],availableChannels=[]})=>{
+  const channels=[...new Set(['EMAIL',...requestedChannels.map(value=>String(value).toUpperCase())])];
+  if(channels.some(channel=>!notificationChannels.includes(channel)||!availableChannels.includes(channel)))throw new Error('Every selected notification channel must have a verified contact.');
+  return channels;
 };
 
 export const verificationMatches=({claims,channel,destination,purpose='CHECKOUT'})=>Boolean(

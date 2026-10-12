@@ -1,9 +1,11 @@
 import { neon } from '@neondatabase/serverless'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
-import { timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { handleUpload } from '@vercel/blob/client'
 import { del as deleteBlob, get as getBlob, list as listBlobs, rename as renameBlob } from '@vercel/blob'
+import { sendInvitationEmail } from './email.js'
+import { verifyPassword as verifyAccountPassword } from './auth.js'
 
 const BCRYPT_ROUNDS = 12
 const bcryptHashPattern = /^\$2[aby]\$\d{2}\$.{53}$/
@@ -117,7 +119,7 @@ const normalizedResourceBody = (resourceName, source = {}) => {
       const local=raw.replace(/\D/g,'').replace(/^0+/,'')
       return local&&/^\+[1-9]\d{0,3}$/.test(countryCode)?`${countryCode}${local}`:raw
     }
-    return {...source,country_code:countryCode,phone:source.phone===undefined?undefined:international(source.phone),whatsapp_number:source.whatsapp_number===undefined?undefined:international(source.whatsapp_number)}
+    return {...source,country_code:countryCode,phone:source.phone===undefined?undefined:(international(source.phone)||null),whatsapp_number:source.whatsapp_number===undefined?undefined:(international(source.whatsapp_number)||null)}
   }
   if (!['product-descriptions', 'products_desccription'].includes(resourceName)) return source
   return {
@@ -324,14 +326,14 @@ export default async function handler(request, response) {
       const admin = user && String(user.role).toUpperCase() === 'ADMIN'
       let passwordMatches = false
       if (user?.password_hash) {
-        passwordMatches = bcryptHashPattern.test(user.password_hash)
-          ? await bcrypt.compare(String(password), user.password_hash)
+        passwordMatches = bcryptHashPattern.test(user.password_hash) || String(user.password_hash).startsWith('scrypt$')
+          ? await verifyAccountPassword(String(password), user.password_hash)
           : matchesLegacyPassword(password, user.password_hash)
       }
       if (!user || !active || !admin || !passwordMatches) {
         return json(response, 401, { error: 'Invalid credentials or administrator access is not permitted.' })
       }
-      if (!bcryptHashPattern.test(user.password_hash)) {
+      if (!bcryptHashPattern.test(user.password_hash) && !String(user.password_hash).startsWith('scrypt$')) {
         const migratedHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS)
         await sql.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [migratedHash, user.id])
       }
@@ -759,11 +761,14 @@ export default async function handler(request, response) {
       const body = normalizedResourceBody(resourceName, request.body || {})
       if (resourceName === 'products' && body.optimize_for_mobile === false) return json(response, 400, { error: 'Mobile image optimization is required for products.' })
       if (resourceName === 'users') {
-        const requiredFields = ['first_name', 'last_name', 'email', 'password_hash', 'country_code', 'phone', 'whatsapp_number', 'role', 'is_active']
+        const requiredFields = ['first_name', 'last_name', 'email', 'country_code', 'role']
         const missingFields = requiredFields.filter((field) => body[field] === undefined || body[field] === '')
         if (missingFields.length) return json(response, 400, { error: `Missing required fields: ${missingFields.join(', ')}.` })
-        const duplicatePhone = await sql.query('SELECT id FROM users WHERE phone = $1 LIMIT 1', [body.phone])
-        if (duplicatePhone.length) return json(response, 409, { error: 'A user with this SMS phone number already exists.' })
+        const duplicate = await sql.query('SELECT id FROM users WHERE LOWER(email)=LOWER($1) OR ($2::text IS NOT NULL AND (phone=$2 OR whatsapp_number=$2)) OR ($3::text IS NOT NULL AND (phone=$3 OR whatsapp_number=$3)) LIMIT 1', [body.email, body.phone, body.whatsapp_number])
+        if (duplicate.length) return json(response, 409, { error: 'A user with one of these contact details already exists.' })
+        body.password_hash = randomBytes(32).toString('hex')
+        body.is_active = false
+        body.preferred_notification_channel = 'EMAIL'
       }
       const columns = resource.columns.filter((column) => availableColumns.includes(column) && body[column] !== undefined && body[column] !== '')
       if (!columns.length) return json(response, 400, { error: 'At least one valid field is required.' })
@@ -773,6 +778,17 @@ export default async function handler(request, response) {
         `INSERT INTO "${resource.table}" (${columns.map((column) => `"${column}"`).join(', ')}) VALUES (${placeholders}) RETURNING ${selectColumns}`,
         values,
       )
+      if (resourceName === 'users') {
+        const user=rows[0],token=randomBytes(32).toString('base64url')
+        const invitation=(await sql.query('INSERT INTO user_invitations(user_id,token_hash,expires_at,created_by) VALUES($1,$2,NOW()+INTERVAL \'48 hours\',$3) RETURNING id',[user.id,createHash('sha256').update(token).digest('hex'),adminSession.id]))[0]
+        const appUrl=String(process.env.CUSTOMER_APP_URL||'http://localhost:5173').replace(/\/$/,'')
+        try {
+          await sendInvitationEmail({to:user.email,name:`${user.first_name} ${user.last_name}`.trim(),invitationUrl:`${appUrl}/?invitation=${encodeURIComponent(token)}`,invitationId:invitation.id})
+        } catch (error) {
+          await sql.query('DELETE FROM users WHERE id=$1 AND is_active=FALSE',[user.id])
+          throw error
+        }
+      }
       return json(response, 201, { message: 'Record created successfully.', [resource.responseKey]: publicRecord(resourceName, rows[0]) })
     }
 
@@ -811,11 +827,23 @@ export default async function handler(request, response) {
         if (!rows[0]?.order) return json(response, 409, { error: 'Order status changed during this request. Refresh and try again.' })
         return json(response, 200, { message: 'Order updated successfully.', order: rows[0].order })
       }
+      if (resourceName === 'users') {
+        const current=(await sql.query('SELECT email,phone,whatsapp_number FROM users WHERE id=$1',[id]))[0]
+        if (!current) return json(response, 404, { error: 'Record not found.' })
+        const email=String(body.email??current.email).trim().toLowerCase(),phone=body.phone===undefined?current.phone:body.phone,whatsapp=body.whatsapp_number===undefined?current.whatsapp_number:body.whatsapp_number
+        const duplicate=await sql.query('SELECT id FROM users WHERE id<>$1 AND (LOWER(email)=LOWER($2) OR ($3::text IS NOT NULL AND (phone=$3 OR whatsapp_number=$3)) OR ($4::text IS NOT NULL AND (phone=$4 OR whatsapp_number=$4))) LIMIT 1',[id,email,phone,whatsapp])
+        if(duplicate.length)return json(response,409,{error:'A user with one of these contact details already exists.'})
+        if(body.preferred_notification_channel==='SMS'&&!phone)return json(response,400,{error:'SMS cannot be preferred without an SMS number.'})
+        if(body.preferred_notification_channel==='WHATSAPP'&&!whatsapp)return json(response,400,{error:'WhatsApp cannot be preferred without a WhatsApp number.'})
+      }
       const columns = resource.columns.filter((column) => availableColumns.includes(column) && body[column] !== undefined && body[column] !== '')
       if (!columns.length) return json(response, 400, { error: 'At least one valid field is required.' })
       const values = await prepareValues(resourceName, columns, body)
       values.push(id)
       const assignments = columns.map((column, index) => `"${column}" = $${index + 1}`)
+      if (resourceName === 'users' && columns.includes('email')) assignments.push('"email_verified_at" = CASE WHEN LOWER(email)<>LOWER($'+(columns.indexOf('email')+1)+') THEN NULL ELSE email_verified_at END')
+      if (resourceName === 'users' && columns.includes('phone')) assignments.push('"phone_verified_at" = CASE WHEN phone IS DISTINCT FROM $'+(columns.indexOf('phone')+1)+' THEN NULL ELSE phone_verified_at END')
+      if (resourceName === 'users' && columns.includes('whatsapp_number')) assignments.push('"whatsapp_verified_at" = CASE WHEN whatsapp_number IS DISTINCT FROM $'+(columns.indexOf('whatsapp_number')+1)+' THEN NULL ELSE whatsapp_verified_at END')
       if (availableColumns.includes('updated_at')) assignments.push('"updated_at" = NOW()')
       const rows = await sql.query(
         `UPDATE "${resource.table}" SET ${assignments.join(', ')} WHERE id = $${values.length} RETURNING ${selectColumns}`,

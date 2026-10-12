@@ -6,53 +6,66 @@ import {getEmailDeliveryStatus,sendOrderSummary} from './email.js';
 import {normalizeWhatsAppNumber,sendOrderSummaryWhatsApp} from './whatsapp.js';
 import {sendOrderSummarySms} from './sms.js';
 import {notFound} from './utils.js';
-import {notificationChannels,resolveNotificationChannel,returnDeadlineOpen,verificationMatches} from './checkoutPolicy.js';
+import {notificationChannelsFor,returnDeadlineOpen,verificationMatches} from './checkoutPolicy.js';
 import {releaseExpiredReservations,reservationMinutes} from './inventoryReservations.js';
 
 const router=Router();
 
-const contactBelongsToCustomer=async(email,phone,whatsapp)=>{
-  if(email&&(await sql`SELECT id FROM users WHERE LOWER(email)=${email} LIMIT 1`)[0])return true;
-  if(phone&&(await sql`SELECT id FROM users WHERE phone=${phone} LIMIT 1`)[0])return true;
-  return Boolean(whatsapp&&(await sql`SELECT id FROM users WHERE whatsapp_number=${whatsapp} LIMIT 1`)[0]);
+const contactBelongsToCustomer=async(email,phone,whatsapp,exceptUserId=null)=>{
+  const match=(await sql`SELECT id FROM users WHERE (${exceptUserId}::bigint IS NULL OR id<>${exceptUserId}) AND (LOWER(email)=${email} OR (${phone}::text IS NOT NULL AND (phone=${phone} OR whatsapp_number=${phone})) OR (${whatsapp}::text IS NOT NULL AND (phone=${whatsapp} OR whatsapp_number=${whatsapp}))) LIMIT 1`)[0];
+  return Boolean(match);
 };
+
+const notificationDestination=(order,channel)=>channel==='EMAIL'?order.contact_email:channel==='SMS'?order.contact_phone:order.contact_whatsapp;
 
 export const sendNotificationSummary=async(order,{resend=false}={})=>{
-  if(order.notification_channel==='EMAIL')return sendOrderSummary(order,{resend});
+  const channels=Array.isArray(order.notification_channels)&&order.notification_channels.length?order.notification_channels:[order.notification_channel||'EMAIL'];
   const items=order.items||await sql`SELECT * FROM order_items WHERE order_id=${order.id} ORDER BY id`;
-  const idempotencyKey=resend?`order-summary/${order.id}/resend/${crypto.randomUUID()}`:`order-summary/${order.id}/created`;
-  const provider=order.notification_channel==='SMS'?'TWILIO':'META_WHATSAPP';
-  const delivery=(await sql`INSERT INTO notification_deliveries(order_id,notification_type,channel,destination,provider,status,idempotency_key) VALUES(${order.id},'ORDER_SUMMARY',${order.notification_channel},${order.notification_destination},${provider},'PENDING',${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=NOW() RETURNING *`)[0];
-  try{
-    const result=order.notification_channel==='SMS'?await sendOrderSummarySms({order,items}):await sendOrderSummaryWhatsApp({order,items});
-    await sql`UPDATE notification_deliveries SET status='ACCEPTED',provider_message_id=${result.id},updated_at=NOW() WHERE id=${delivery.id}`;
-    return{status:'ACCEPTED',message_id:result.id};
-  }catch(error){
-    console.error('Order notification failed',{orderId:order.id,channel:order.notification_channel,error:error.message,providerCode:error.providerCode,statusCode:error.statusCode});
-    await sql`UPDATE notification_deliveries SET status='FAILED',error_message=${String(error.message).slice(0,500)},updated_at=NOW() WHERE id=${delivery.id}`;
-    return{status:'FAILED'};
+  const results={};
+  for(const channel of channels){
+    const destination=notificationDestination(order,channel);
+    if(!destination)continue;
+    const channelOrder={...order,notification_channel:channel,notification_destination:destination};
+    if(channel==='EMAIL'){results[channel]=await sendOrderSummary(channelOrder,{resend});continue}
+    const idempotencyKey=resend?`order-summary/${order.id}/${channel.toLowerCase()}/resend/${crypto.randomUUID()}`:`order-summary/${order.id}/${channel.toLowerCase()}/created`;
+    const provider=channel==='SMS'?'TWILIO':'META_WHATSAPP';
+    const delivery=(await sql`INSERT INTO notification_deliveries(order_id,notification_type,channel,destination,provider,status,idempotency_key) VALUES(${order.id},'ORDER_SUMMARY',${channel},${destination},${provider},'PENDING',${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=NOW() RETURNING *`)[0];
+    try{
+      const result=channel==='SMS'?await sendOrderSummarySms({order:channelOrder,items}):await sendOrderSummaryWhatsApp({order:channelOrder,items});
+      await sql`UPDATE notification_deliveries SET status='ACCEPTED',provider_message_id=${result.id},updated_at=NOW() WHERE id=${delivery.id}`;
+      results[channel]={status:'ACCEPTED',message_id:result.id};
+    }catch(error){
+      console.error('Order notification failed',{orderId:order.id,channel,error:error.message,providerCode:error.providerCode,statusCode:error.statusCode});
+      await sql`UPDATE notification_deliveries SET status='FAILED',error_message=${String(error.message).slice(0,500)},updated_at=NOW() WHERE id=${delivery.id}`;
+      results[channel]={status:'FAILED'};
+    }
   }
+  return results;
 };
 
-const verifiedNotification=async(req,user)=>{
-  const requestedChannel=String(req.body.notification_channel||user?.preferred_notification_channel||'').toUpperCase();
+const verifiedNotifications=async(req,user)=>{
   const email=String(req.body.contact_email||user?.email||'').trim().toLowerCase();
   if(!email)throw Object.assign(new Error('Email address is required for checkout.'),{status:400});
-  const channel=resolveNotificationChannel({customer:Boolean(user),email,requestedChannel,preferredChannel:user?.preferred_notification_channel});
-  const destination=channel==='EMAIL'?email:channel==='WHATSAPP'?normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_whatsapp||user?.whatsapp_number):normalizeWhatsAppNumber(req.body.notification_destination||req.body.contact_phone||user?.phone);
-  if(!notificationChannels.includes(channel)||!destination)throw Object.assign(new Error('Select and confirm an email, SMS, or WhatsApp notification channel.'),{status:400});
-  if(user){
-    const expected=channel==='EMAIL'?String(user.email).toLowerCase():channel==='WHATSAPP'?normalizeWhatsAppNumber(user.whatsapp_number):normalizeWhatsAppNumber(user.phone);
-    const verified=channel==='EMAIL'?user.email_verified_at:channel==='SMS'?user.phone_verified_at:user.whatsapp_verified_at;
-    if(destination!==expected)throw Object.assign(new Error('Use the selected contact stored on your customer account.'),{status:403});
-    if(verified)return{channel,destination};
+  if(user&&email!==String(user.email).toLowerCase())throw Object.assign(new Error('Use the email address stored on your customer account.'),{status:403});
+  const phone=normalizeWhatsAppNumber(req.body.contact_phone||''),whatsapp=normalizeWhatsAppNumber(req.body.contact_whatsapp||'');
+  const destinations={EMAIL:email,...(phone?{SMS:phone}:{}),...(whatsapp?{WHATSAPP:whatsapp}:{})};
+  const requested=Array.isArray(req.body.notification_channels)?req.body.notification_channels:[];
+  let channels;
+  try{channels=notificationChannelsFor({requestedChannels:requested,availableChannels:Object.keys(destinations)})}catch(error){throw Object.assign(error,{status:400})}
+  if(await contactBelongsToCustomer(email,phone,whatsapp,user?.id||null))throw Object.assign(new Error(user?'A checkout contact belongs to another customer account.':'This contact belongs to a customer account. Log in before checking out.'),{status:409,code:'CUSTOMER_LOGIN_REQUIRED'});
+  const challengeIds=[];
+  for(const[channel,destination]of Object.entries(destinations)){
+    const accountDestination=channel==='EMAIL'?String(user?.email||'').toLowerCase():channel==='SMS'?normalizeWhatsAppNumber(user?.phone):normalizeWhatsAppNumber(user?.whatsapp_number);
+    const accountVerified=channel==='EMAIL'?user?.email_verified_at:channel==='SMS'?user?.phone_verified_at:user?.whatsapp_verified_at;
+    if(user&&destination===accountDestination&&accountVerified)continue;
+    let claims;
+    try{claims=verifyNotificationToken(req.body.notification_verification_tokens?.[channel])}catch{throw Object.assign(new Error(`Verify ${channel.toLowerCase()} before placing the order.`),{status:403})}
+    if(!verificationMatches({claims,channel,destination}))throw Object.assign(new Error(`The ${channel.toLowerCase()} verification does not match this checkout.`),{status:403});
+    const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${claims.verification_id} AND channel=${channel} AND destination=${destination} AND purpose='CHECKOUT' AND verified_at IS NOT NULL AND consumed_at IS NULL AND (${user?.id||null}::bigint IS NULL OR user_id=${user?.id||null})`)[0];
+    if(!challenge)throw Object.assign(new Error(`${channel} verification is incomplete or already used.`),{status:403});
+    challengeIds.push(challenge.id);
   }
-  let claims;
-  try{claims=verifyNotificationToken(req.body.notification_verification_token)}catch{throw Object.assign(new Error('Verify the selected notification destination before placing the order.'),{status:403})}
-  if(!verificationMatches({claims,channel,destination}))throw Object.assign(new Error('The verification must match the selected channel and destination.'),{status:403});
-  const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${claims.verification_id} AND channel=${channel} AND destination=${destination} AND purpose='CHECKOUT' AND verified_at IS NOT NULL AND (${user?.id||null}::bigint IS NULL OR user_id=${user?.id||null})`)[0];
-  if(!challenge)throw Object.assign(new Error('Notification verification is incomplete.'),{status:403});
-  return{channel,destination};
+  return{channels,destinations,challengeIds};
 };
 
 const createOrder=async(req,res,user=null)=>{
@@ -63,12 +76,11 @@ const createOrder=async(req,res,user=null)=>{
   if(!['CASH','STRIPE'].includes(paymentMethod))return res.status(400).json({error:'Payment method must be CASH or STRIPE.'});
   if(!shipping_name||!shipping_address||!Array.isArray(items)||!items.length)return res.status(400).json({error:'Shipping name, address, and items are required.'});
   let notification;
-  try{notification=await verifiedNotification(req,user)}catch(error){return res.status(error.status||400).json({error:error.message})}
-  const contactEmail=String(req.body.contact_email||user?.email||'').trim().toLowerCase()||(notification.channel==='EMAIL'?notification.destination:null);
-  const contactPhone=normalizeWhatsAppNumber(req.body.contact_phone||user?.phone||shipping_phone)||(notification.channel==='SMS'?notification.destination:null);
-  const contactWhatsapp=normalizeWhatsAppNumber(req.body.contact_whatsapp||user?.whatsapp_number)||(notification.channel==='WHATSAPP'?notification.destination:null);
+  try{notification=await verifiedNotifications(req,user)}catch(error){return res.status(error.status||400).json({error:error.message,code:error.code})}
+  const contactEmail=notification.destinations.EMAIL;
+  const contactPhone=notification.destinations.SMS||null;
+  const contactWhatsapp=notification.destinations.WHATSAPP||null;
   const deliveryPhone=normalizeWhatsAppNumber(shipping_phone)||contactPhone||null;
-  if(!user&&await contactBelongsToCustomer(contactEmail,contactPhone,contactWhatsapp))return res.status(409).json({error:'This contact belongs to a customer account. Log in before checking out.',code:'CUSTOMER_LOGIN_REQUIRED'});
   const returnWindowDays=user?Number(user.return_window_days):2;
   const requested=new Map();
   let total=0;
@@ -106,15 +118,21 @@ const createOrder=async(req,res,user=null)=>{
       SELECT available,requested_quantity FROM locked_products
     ), eligible AS MATERIALIZED (
       SELECT COUNT(*)=(SELECT COUNT(*) FROM requested) AND COALESCE(BOOL_AND(available>=requested_quantity),false) ok FROM inventory
+    ), consumed_verifications AS (
+      UPDATE notification_verifications SET consumed_at=NOW()
+      WHERE id=ANY($18::bigint[]) AND consumed_at IS NULL AND (SELECT ok FROM eligible)
+      RETURNING id
+    ), proofs_ok AS MATERIALIZED (
+      SELECT COUNT(*)=cardinality($18::bigint[]) ok FROM consumed_verifications
     ), reduced_colors AS (
       UPDATE product_color pc SET quantity=pc.quantity-r.quantity,updated_at=NOW()
-      FROM requested r,eligible e WHERE e.ok AND r.product_color_id IS NOT NULL AND pc.id=r.product_color_id RETURNING pc.id
+      FROM requested r,eligible e,proofs_ok v WHERE e.ok AND v.ok AND r.product_color_id IS NOT NULL AND pc.id=r.product_color_id RETURNING pc.id
     ), reduced_products AS (
       UPDATE products p SET stock_quantity=p.stock_quantity-r.quantity,updated_at=NOW()
-      FROM requested r,eligible e WHERE e.ok AND r.product_color_id IS NULL AND p.id=r.product_id RETURNING p.id
+      FROM requested r,eligible e,proofs_ok v WHERE e.ok AND v.ok AND r.product_color_id IS NULL AND p.id=r.product_id RETURNING p.id
     ), new_order AS (
-      INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,contact_whatsapp,payment_method,payment_status,notification_channel,notification_destination,return_window_days,inventory_reserved_at,inventory_reserved_until)
-      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$15,$10,'UNPAID',$11,$12,$14,NOW(),NOW()+($16::int*INTERVAL '1 minute') FROM eligible WHERE ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
+      INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,contact_whatsapp,payment_method,payment_status,notification_channel,notification_destination,return_window_days,inventory_reserved_at,inventory_reserved_until,notification_channels)
+      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$15,$10,'UNPAID',$11,$12,$14,NOW(),NOW()+($16::int*INTERVAL '1 minute'),$17 FROM eligible,proofs_ok WHERE eligible.ok AND proofs_ok.ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
       RETURNING *
     ), new_items AS (
       INSERT INTO order_items(order_id,product_id,product_color_id,color,product_name,quantity,unit_price,subtotal)
@@ -123,9 +141,9 @@ const createOrder=async(req,res,user=null)=>{
       INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id)
       SELECT id,'ORDER_CREATED','PENDING','UNPAID',$13,$2 FROM new_order RETURNING id
     ) SELECT * FROM new_order WHERE (SELECT COUNT(*) FROM new_items)>0 AND (SELECT COUNT(*) FROM new_event)>0
-  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,notification.channel,notification.destination,user?'CUSTOMER':'GUEST',returnWindowDays,contactWhatsapp,reservationMinutes()]);
+  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,'EMAIL',contactEmail,user?'CUSTOMER':'GUEST',returnWindowDays,contactWhatsapp,reservationMinutes(),notification.channels,notification.challengeIds]);
   const order=created[0];
-  if(!order)return res.status(409).json({error:'Insufficient stock for one or more selected products.'});
+  if(!order)return res.status(409).json({error:'Inventory changed or a contact verification was already used. Review the order and verify again if needed.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
   order.notification=paymentMethod==='STRIPE'?{status:'PENDING_PAYMENT'}:await sendNotificationSummary(order);
   if(!user)order.order_access_token=orderAccessTokenFor(order);
@@ -139,8 +157,10 @@ const resendOrderSummary=async(res,order)=>{
   if(recent.length>=3)return res.status(429).json({error:'Order summary resend limit reached. Try again in one hour.'});
   if(recent[0]&&Date.now()-new Date(recent[0].created_at).getTime()<60000)return res.status(429).json({error:'Please wait before resending the order summary.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
-  const notification=await sendNotificationSummary(order,{resend:true});
-  return notification.status==='ACCEPTED'?res.json(notification):res.status(503).json({error:'The order summary could not be sent. Please try again.'});
+  const notifications=await sendNotificationSummary(order,{resend:true});
+  const channels=Array.isArray(order.notification_channels)&&order.notification_channels.length?order.notification_channels:[order.notification_channel||'EMAIL'];
+  const accepted=channels.every(channel=>notifications[channel]?.status==='ACCEPTED');
+  return accepted?res.json({status:'ACCEPTED',channels,notifications}):res.status(503).json({error:'The order summary could not be sent. Please try again.',notifications});
 };
 
 const orderNotificationStatus=async(res,order)=>{
@@ -217,7 +237,7 @@ router.post('/orders/:id/guest-notifications/resend',async(req,res)=>{
   try{access=verifyOrderAccessToken(req.get('x-order-access-token'))}catch{return res.status(403).json({error:'Guest order access has expired.'})}
   const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id IS NULL`)[0];
   if(!order||access.type!=='guest-order'||String(access.sub)!==String(order.id)||access.destination!==order.notification_destination)return notFound(res,'Order');
-  return resendOrderSummary(res,order);
+  return resendOrderSummary(res,{...order,notification_channels:['EMAIL'],notification_channel:'EMAIL'});
 });
 router.get('/orders/:id/guest-notifications/status',async(req,res)=>{
   let access;
@@ -362,7 +382,7 @@ router.post('/orders/:id/notifications/resend',async(req,res)=>{
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel))return res.status(400).json({error:'Select email, SMS, or WhatsApp.'});
   const destination=channel==='EMAIL'?String(order.contact_email||req.user.email||'').trim().toLowerCase():channel==='WHATSAPP'?normalizeWhatsAppNumber(order.contact_whatsapp||req.user.whatsapp_number):normalizeWhatsAppNumber(order.contact_phone||req.user.phone);
   if(!destination)return res.status(400).json({error:`No ${channel==='EMAIL'?'email address':'phone number'} is available for this order.`});
-  return resendOrderSummary(res,{...order,notification_channel:channel,notification_destination:destination});
+  return resendOrderSummary(res,{...order,notification_channels:[channel],notification_channel:channel,notification_destination:destination});
 });
 router.get('/order-items/order/:id',async(req,res)=>{const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id}`)[0];if(!order||!isAdmin(req.user)&&String(order.user_id)!==String(req.user.id))return res.status(403).json({error:'Access denied.'});return res.json(await sql`SELECT * FROM order_items WHERE order_id=${req.params.id}`)});
 

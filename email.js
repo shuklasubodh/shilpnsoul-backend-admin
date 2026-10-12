@@ -33,10 +33,17 @@ const Frame=({preview,title,children})=>h(Html,{lang:'en',dir:'ltr'},h(Head),h(B
   )));
 
 const OtpEmail=({code,purpose,expiresMinutes})=>h(Frame,{preview:`Your verification code expires in ${expiresMinutes} minutes.`,title:'Confirm your email address'},
-  h(Text,{style:{fontSize:'16px',lineHeight:'1.6'}},purpose==='REGISTRATION'?'Use this code to finish creating your customer account.':'Use this code to confirm email notifications before placing your order.'),
+  h(Text,{style:{fontSize:'16px',lineHeight:'1.6'}},purpose==='REGISTRATION'?'Use this code to finish creating your customer account.':purpose==='PASSWORD_RESET'?'Use this code to reset your account password.':purpose==='INITIAL_ADMIN'?'Use this code to authorize creation of the first Shilp & Soul administrator. If you did not start setup, do not share this code.':'Use this code to confirm email notifications before placing your order.'),
   h(Section,{style:{backgroundColor:colors.paper,border:`1px solid ${colors.line}`,padding:'18px',textAlign:'center'}},
     h(Text,{style:{fontFamily:'Courier New, monospace',fontSize:'30px',fontWeight:'700',letterSpacing:'6px',margin:0}},code)),
   h(Text,{style:{color:colors.muted,fontSize:'14px',lineHeight:'1.5'}},`This code expires in ${expiresMinutes} minutes. If you did not request it, you can ignore this email.`));
+
+const InvitationEmail=({name,invitationUrl,expiresHours})=>h(Frame,{preview:'Complete your Shilp & Soul account setup.',title:'You are invited'},
+  h(Text,{style:{fontSize:'16px',lineHeight:'1.6'}},`Hello ${name || 'there'}, an administrator created a Shilp & Soul account for you.`),
+  h(Text,{style:{fontSize:'14px',lineHeight:'1.6'}},'Open the secure invitation below to create your password and verify any SMS or WhatsApp contact included with your account.'),
+  h(Section,{style:{margin:'24px 0'}},h('a',{href:invitationUrl,style:{backgroundColor:colors.brand,color:'#ffffff',display:'inline-block',padding:'12px 18px',textDecoration:'none'}},'Complete account setup')),
+  h(Text,{style:{color:colors.muted,fontSize:'13px',lineHeight:'1.5',wordBreak:'break-all'}},invitationUrl),
+  h(Text,{style:{color:colors.muted,fontSize:'13px'}},`This invitation expires in ${expiresHours} hours.`));
 
 const OrderSummaryEmail=({order,items})=>h(Frame,{preview:`Order ${order.order_number} received. Total S$${Number(order.total_amount).toFixed(2)}.`,title:'Your order is confirmed'},
   h(Text,{style:{fontSize:'16px',lineHeight:'1.6'}},`Thank you, ${order.shipping_name}. We received order ${order.order_number}.`),
@@ -74,6 +81,15 @@ export const sendOtpEmail=({to,code,purpose,verificationId,expiresMinutes=10})=>
   to,subject:`Your Shilp & Soul verification code`,element:h(OtpEmail,{code,purpose,expiresMinutes}),
   text:`Your Shilp & Soul verification code is ${code}. It expires in ${expiresMinutes} minutes. If you did not request it, ignore this email.`,
   idempotencyKey:`otp/${verificationId}`,tags:[{name:'email_type',value:'otp'}],
+});
+
+export const sendInvitationEmail=({to,name,invitationUrl,invitationId,expiresHours=48})=>sendEmail({
+  to,
+  subject:'Complete your Shilp & Soul account setup',
+  element:h(InvitationEmail,{name,invitationUrl,expiresHours}),
+  text:`Hello ${name || 'there'}, complete your Shilp & Soul account setup: ${invitationUrl}. This invitation expires in ${expiresHours} hours.`,
+  idempotencyKey:`user-invitation/${invitationId}`,
+  tags:[{name:'email_type',value:'user_invitation'}],
 });
 
 export async function sendOrderSummary(order,{resend=false}={}){

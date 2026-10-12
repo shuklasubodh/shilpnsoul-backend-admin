@@ -1,17 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {resolveNotificationChannel,returnDeadlineOpen,verificationMatches} from './checkoutPolicy.js';
+import {notificationChannelsFor,returnDeadlineOpen,verificationChannelsFor,verificationMatches} from './checkoutPolicy.js';
 
-test('guest selection is honored when a mandatory email is also supplied',()=>{
-  assert.equal(resolveNotificationChannel({customer:false,email:'guest@example.com',requestedChannel:'SMS'}),'SMS');
+test('email alone requires only email verification',()=>{
+  assert.deepEqual(verificationChannelsFor({email:'guest@example.com'}),['EMAIL']);
 });
 
-test('guest defaults to email when no notification channel is requested',()=>{
-  assert.equal(resolveNotificationChannel({customer:false,email:'guest@example.com'}),'EMAIL');
+test('every supplied optional contact requires verification',()=>{
+  assert.deepEqual(verificationChannelsFor({email:'guest@example.com',phone:'+6590000000',whatsapp:'+6591111111'}),['EMAIL','SMS','WHATSAPP']);
 });
 
-test('customer preference is honored instead of forcing email',()=>{
-  assert.equal(resolveNotificationChannel({customer:true,email:'customer@example.com',preferredChannel:'WHATSAPP'}),'WHATSAPP');
+test('email is always included and verified optional channels can be added',()=>{
+  assert.deepEqual(notificationChannelsFor({requestedChannels:['SMS','WHATSAPP'],availableChannels:['EMAIL','SMS','WHATSAPP']}),['EMAIL','SMS','WHATSAPP']);
+  assert.deepEqual(notificationChannelsFor({availableChannels:['EMAIL']}),['EMAIL']);
+});
+
+test('an unavailable optional notification channel is rejected',()=>{
+  assert.throws(()=>notificationChannelsFor({requestedChannels:['SMS'],availableChannels:['EMAIL']}),/verified contact/);
 });
 
 test('OTP proof must match both selected channel and exact destination',()=>{

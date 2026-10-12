@@ -11,21 +11,34 @@ const router=Router();
 const normalize=(channel,value)=>channel==='EMAIL'?String(value||'').trim().toLowerCase():normalizeWhatsAppNumber(value);
 const codeHash=(code,destination,nonce)=>crypto.createHmac('sha256',authSecret()).update(`${code}:${destination}:${nonce}`).digest('hex');
 const safeEqual=(left,right)=>{const a=Buffer.from(left),b=Buffer.from(right);return a.length===b.length&&crypto.timingSafeEqual(a,b)};
+const tokenHash=value=>crypto.createHash('sha256').update(String(value)).digest('hex');
 
 router.post('/notification-verifications/request',optionalAuthenticate,async(req,res)=>{
   const channel=String(req.body.channel||'').toUpperCase(),purpose=String(req.body.purpose||'').toUpperCase(),destination=normalize(channel,req.body.destination);
-  if(!['REGISTRATION','CHECKOUT'].includes(purpose))return res.status(400).json({error:'Invalid verification purpose.'});
+  if(!['REGISTRATION','CHECKOUT','INVITATION'].includes(purpose))return res.status(400).json({error:'Invalid verification purpose.'});
   if(purpose==='REGISTRATION'&&process.env.REGISTRATION_ENABLED!=='true')return res.status(403).json({error:'New account registration is currently unavailable.'});
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||(channel==='EMAIL'?!emailPattern.test(destination):!destination))return res.status(400).json({error:'A valid email or mobile notification destination is required.'});
+  let verificationUserId=req.user?.id||null;
+  if(purpose==='INVITATION'){
+    const invitation=(await sql`SELECT i.user_id,u.email,u.phone,u.whatsapp_number FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${tokenHash(req.body.invitation_token)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
+    if(!invitation)return res.status(410).json({error:'This invitation is invalid or expired.'});
+    const expected=channel==='EMAIL'?String(invitation.email).toLowerCase():channel==='WHATSAPP'?normalizeWhatsAppNumber(invitation.whatsapp_number):normalizeWhatsAppNumber(invitation.phone);
+    if(channel==='EMAIL'||!expected||destination!==expected)return res.status(403).json({error:'Verify an optional contact included in this invitation.'});
+    verificationUserId=invitation.user_id;
+  }
   if(!req.user&&purpose==='CHECKOUT'){
     const existing=channel==='EMAIL'
       ?(await sql`SELECT id FROM users WHERE LOWER(email)=${destination} LIMIT 1`)[0]
-      :channel==='WHATSAPP'?(await sql`SELECT id FROM users WHERE whatsapp_number=${destination} LIMIT 1`)[0]
-      :(await sql`SELECT id FROM users WHERE phone=${destination} LIMIT 1`)[0];
+      :(await sql`SELECT id FROM users WHERE phone=${destination} OR whatsapp_number=${destination} LIMIT 1`)[0];
     if(existing)return res.status(409).json({error:'This contact belongs to a customer account. Log in before checking out.',code:'CUSTOMER_LOGIN_REQUIRED'});
   }
   const expectedAccountDestination=channel==='EMAIL'?String(req.user?.email||'').toLowerCase():channel==='WHATSAPP'?normalizeWhatsAppNumber(req.user?.whatsapp_number):normalizeWhatsAppNumber(req.user?.phone);
-  if(req.user&&destination!==expectedAccountDestination)return res.status(403).json({error:'Verify the selected contact stored on your account.'});
+  if(req.user&&purpose==='CHECKOUT'&&destination!==expectedAccountDestination){
+    const duplicate=channel==='EMAIL'
+      ?(await sql`SELECT id FROM users WHERE LOWER(email)=${destination} AND id<>${req.user.id} LIMIT 1`)[0]
+      :(await sql`SELECT id FROM users WHERE id<>${req.user.id} AND (phone=${destination} OR whatsapp_number=${destination}) LIMIT 1`)[0];
+    if(duplicate)return res.status(409).json({error:'This contact belongs to another customer account.'});
+  }
   if(req.user&&purpose==='CHECKOUT'&&destination===String(req.user.email).toLowerCase()&&req.user.email_verified_at)return res.json({verified:true,channel,destination});
   if(req.user&&purpose==='CHECKOUT'&&channel==='SMS'&&destination===normalizeWhatsAppNumber(req.user.phone)&&req.user.phone_verified_at)return res.json({verified:true,channel,destination});
   if(req.user&&purpose==='CHECKOUT'&&channel==='WHATSAPP'&&destination===normalizeWhatsAppNumber(req.user.whatsapp_number)&&req.user.whatsapp_verified_at)return res.json({verified:true,channel,destination});
@@ -35,7 +48,7 @@ router.post('/notification-verifications/request',optionalAuthenticate,async(req
   if(recent.length>=3)return res.status(429).json({error:'Verification code limit reached. Try again in one hour.'});
 
   const code=String(crypto.randomInt(100000,1000000)),nonce=crypto.randomBytes(16).toString('hex');
-  const verification=(await sql`INSERT INTO notification_verifications(user_id,channel,destination,purpose,code_hash,nonce,expires_at) VALUES(${req.user?.id||null},${channel},${destination},${purpose},${codeHash(code,destination,nonce)},${nonce},NOW()+INTERVAL '10 minutes') RETURNING id,expires_at`)[0];
+  const verification=(await sql`INSERT INTO notification_verifications(user_id,channel,destination,purpose,code_hash,nonce,expires_at) VALUES(${verificationUserId},${channel},${destination},${purpose},${codeHash(code,destination,nonce)},${nonce},NOW()+INTERVAL '10 minutes') RETURNING id,expires_at`)[0];
   const idempotencyKey=`otp/${verification.id}`;
   const provider=channel==='WHATSAPP'?'META_WHATSAPP':channel==='SMS'?'TWILIO':'RESEND';
   const delivery=(await sql`INSERT INTO notification_deliveries(verification_id,notification_type,channel,destination,provider,status,idempotency_key) VALUES(${verification.id},'OTP',${channel},${destination},${provider},'PENDING',${idempotencyKey}) RETURNING id`)[0];
@@ -54,7 +67,7 @@ router.post('/notification-verifications/verify',optionalAuthenticate,async(req,
   const id=String(req.body.verification_id||''),code=String(req.body.code||'').trim();
   if(!/^\d+$/.test(id)||!/^\d{6}$/.test(code))return res.status(400).json({error:'A valid verification code is required.'});
   const verification=(await sql`SELECT * FROM notification_verifications WHERE id=${id}`)[0];
-  if(!verification||verification.verified_at||new Date(verification.expires_at)<=new Date()||verification.attempts>=5)return res.status(410).json({error:'This verification code has expired. Request a new code.'});
+  if(!verification||verification.verified_at||verification.consumed_at||new Date(verification.expires_at)<=new Date()||verification.attempts>=5)return res.status(410).json({error:'This verification code has expired. Request a new code.'});
   let approved;
   try{approved=verification.channel==='SMS'?await verifyOtpSms({to:verification.destination,code}):safeEqual(codeHash(code,verification.destination,verification.nonce),verification.code_hash)}catch(error){
     console.error('Verification check failed',{channel:verification.channel,code:error.providerCode||error.code||null,status:error.statusCode||null,message:error.message});
@@ -65,9 +78,6 @@ router.post('/notification-verifications/verify',optionalAuthenticate,async(req,
     return res.status(400).json({error:'Incorrect verification code.'});
   }
   await sql`UPDATE notification_verifications SET verified_at=NOW() WHERE id=${id}`;
-  if(req.user&&verification.channel==='EMAIL'&&verification.destination===String(req.user.email).toLowerCase())await sql`UPDATE users SET email_verified_at=NOW(),updated_at=NOW() WHERE id=${req.user.id}`;
-  if(req.user&&verification.channel==='SMS'&&verification.destination===normalizeWhatsAppNumber(req.user.phone))await sql`UPDATE users SET phone_verified_at=NOW(),updated_at=NOW() WHERE id=${req.user.id}`;
-  if(req.user&&verification.channel==='WHATSAPP'&&verification.destination===normalizeWhatsAppNumber(req.user.whatsapp_number))await sql`UPDATE users SET whatsapp_verified_at=NOW(),updated_at=NOW() WHERE id=${req.user.id}`;
   const verificationToken=notificationTokenFor({channel:verification.channel,destination:verification.destination,purpose:verification.purpose,verificationId:verification.id});
   return res.json({verified:true,channel:verification.channel,destination:verification.destination,verification_token:verificationToken});
 });

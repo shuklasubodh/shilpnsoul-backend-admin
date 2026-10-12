@@ -1,25 +1,122 @@
-import{Router}from'express';import sql from'./db.js';import{authenticate,hashPassword,tokenFor,verifyNotificationToken,verifyPassword}from'./auth.js';import{emailPattern,normalizeCountryCode,phoneWithCountryCode,userColumns}from'./utils.js';import{normalizeWhatsAppNumber}from'./whatsapp.js';
+import crypto from 'node:crypto';
+import {Router} from 'express';
+import sql from './db.js';
+import {authenticate,authSecret,hashPassword,tokenFor,verifyNotificationToken,verifyPassword} from './auth.js';
+import {sendOtpEmail} from './email.js';
+import {emailPattern,normalizeCountryCode,phoneWithCountryCode,userColumns} from './utils.js';
+import {normalizeWhatsAppNumber} from './whatsapp.js';
+
 const router=Router();
 const registrationEnabled=process.env.REGISTRATION_ENABLED==='true';
+const normalizeEmail=value=>String(value||'').trim().toLowerCase();
+const hashValue=value=>crypto.createHash('sha256').update(String(value)).digest('hex');
+const codeHash=(code,destination,nonce)=>crypto.createHmac('sha256',authSecret()).update(`${code}:${destination}:${nonce}`).digest('hex');
+const safeEqual=(left,right)=>{const a=Buffer.from(String(left)),b=Buffer.from(String(right));return a.length===b.length&&crypto.timingSafeEqual(a,b)};
+const optionalPhone=(countryCode,value)=>String(value||'').trim()?normalizeWhatsAppNumber(phoneWithCountryCode(countryCode,value)):null;
+const optionalWhatsApp=value=>String(value||'').trim()?normalizeWhatsAppNumber(value):null;
+
+const assertUniqueContacts=async({email,phone,whatsapp,userId=null})=>{
+  const duplicate=(await sql`
+    SELECT id FROM users
+    WHERE (${userId}::bigint IS NULL OR id<>${userId})
+      AND (LOWER(email)=${email}
+        OR (${phone}::text IS NOT NULL AND (phone=${phone} OR whatsapp_number=${phone}))
+        OR (${whatsapp}::text IS NOT NULL AND (phone=${whatsapp} OR whatsapp_number=${whatsapp})))
+    LIMIT 1
+  `)[0];
+  if(duplicate)throw Object.assign(new Error('An account already uses one of these contact details.'),{status:409});
+};
+
+const verifiedProof=async({token,channel,destination,purpose,userId=null})=>{
+  let proof;
+  try{proof=verifyNotificationToken(token)}catch{throw Object.assign(new Error(`Verify ${channel.toLowerCase()} before continuing.`),{status:403})}
+  if(proof.type!=='notification-verification'||proof.purpose!==purpose||proof.channel!==channel||proof.destination!==destination)throw Object.assign(new Error(`The ${channel.toLowerCase()} verification does not match.`),{status:403});
+  const challenge=(await sql`
+    SELECT id FROM notification_verifications
+    WHERE id=${proof.verification_id} AND channel=${channel} AND destination=${destination}
+      AND purpose=${purpose} AND verified_at IS NOT NULL AND consumed_at IS NULL
+      AND (${userId}::bigint IS NULL OR user_id=${userId})
+  `)[0];
+  if(!challenge)throw Object.assign(new Error(`${channel} verification is incomplete or already used.`),{status:403});
+  return challenge.id;
+};
+
 router.post('/auth/register',async(req,res)=>{
   if(!registrationEnabled)return res.status(403).json({error:'New account registration is currently unavailable.'});
-  const firstName=String(req.body.first_name||'').trim(),lastName=String(req.body.last_name||'').trim(),email=String(req.body.email||'').trim().toLowerCase(),countryCode=normalizeCountryCode(req.body.country_code||'+65'),phone=normalizeWhatsAppNumber(phoneWithCountryCode(countryCode,req.body.phone)),whatsappNumber=normalizeWhatsAppNumber(req.body.whatsapp_number),password=String(req.body.password||'');
+  const firstName=String(req.body.first_name||'').trim(),lastName=String(req.body.last_name||'').trim();
+  const email=normalizeEmail(req.body.email),countryCode=normalizeCountryCode(req.body.country_code||'+65');
+  const phone=optionalPhone(countryCode,req.body.phone),whatsappNumber=optionalWhatsApp(req.body.whatsapp_number),password=String(req.body.password||'');
   const preferredChannel=String(req.body.preferred_notification_channel||'EMAIL').toUpperCase();
-  if(!firstName||!lastName||!emailPattern.test(email)||!phone||!whatsappNumber||password.length<12||!['EMAIL','SMS','WHATSAPP'].includes(preferredChannel))return res.status(400).json({error:'Name, email, SMS number, WhatsApp number, notification preference, and a password of at least 12 characters are required.'});
-  const destinations={EMAIL:email,SMS:phone,WHATSAPP:whatsappNumber},proofs={};
-  try{for(const channel of Object.keys(destinations))proofs[channel]=verifyNotificationToken(req.body.verification_tokens?.[channel])}catch{return res.status(403).json({error:'Verify email, SMS, and WhatsApp before registration.'})}
-  for(const[channel,destination]of Object.entries(destinations)){
-    const proof=proofs[channel];
-    if(proof.type!=='notification-verification'||proof.purpose!=='REGISTRATION'||proof.channel!==channel||proof.destination!==destination)return res.status(403).json({error:`The ${channel} verification does not match this registration.`});
-    const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${proof.verification_id} AND channel=${channel} AND destination=${destination} AND purpose='REGISTRATION' AND user_id IS NULL AND verified_at IS NOT NULL`)[0];
-    if(!challenge)return res.status(403).json({error:`${channel} verification is incomplete.`});
-  }
-  const duplicatePhone=(await sql`SELECT id FROM users WHERE phone=${phone} LIMIT 1`)[0];
-  if(duplicatePhone)return res.status(409).json({error:'A user with this SMS phone number already exists.'});
-  const hash=await hashPassword(password);
-  const user=(await sql.query(`INSERT INTO users(first_name,last_name,email,password_hash,country_code,phone,whatsapp_number,role,is_active,email_verified_at,phone_verified_at,whatsapp_verified_at,preferred_notification_channel) VALUES($1,$2,$3,$4,$5,$6,$7,'CUSTOMER',TRUE,NOW(),NOW(),NOW(),$8) RETURNING ${userColumns}`,[firstName,lastName,email,hash,countryCode,phone,whatsappNumber,preferredChannel]))[0];
-  return res.status(201).json({token:tokenFor(user),user});
+  if(!firstName||!lastName||!emailPattern.test(email)||!countryCode||password.length<12)return res.status(400).json({error:'Name, a valid email, and a password of at least 12 characters are required.'});
+  if(String(req.body.phone||'').trim()&&!phone)return res.status(400).json({error:'Enter a valid SMS number.'});
+  if(String(req.body.whatsapp_number||'').trim()&&!whatsappNumber)return res.status(400).json({error:'Enter a valid WhatsApp number.'});
+  const destinations={EMAIL:email,...(phone?{SMS:phone}:{}),...(whatsappNumber?{WHATSAPP:whatsappNumber}:{})};
+  if(!destinations[preferredChannel])return res.status(400).json({error:'The preferred notification channel must have a supplied contact.'});
+  try{
+    await assertUniqueContacts({email,phone,whatsapp:whatsappNumber});
+    const challengeIds=[];
+    for(const[channel,destination]of Object.entries(destinations))challengeIds.push(await verifiedProof({token:req.body.verification_tokens?.[channel],channel,destination,purpose:'REGISTRATION'}));
+    const hash=await hashPassword(password);
+    const user=(await sql.query(`INSERT INTO users(first_name,last_name,email,password_hash,country_code,phone,whatsapp_number,role,is_active,email_verified_at,phone_verified_at,whatsapp_verified_at,preferred_notification_channel) VALUES($1,$2,$3,$4,$5,$6,$7,'CUSTOMER',TRUE,NOW(),CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END,CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,$8) RETURNING ${userColumns}`,[firstName,lastName,email,hash,countryCode,phone,whatsappNumber,preferredChannel]))[0];
+    await sql`UPDATE notification_verifications SET consumed_at=NOW() WHERE id=ANY(${challengeIds}::bigint[]) AND consumed_at IS NULL`;
+    return res.status(201).json({token:tokenFor(user),user});
+  }catch(error){return res.status(error.status||(/already assigned|duplicate/i.test(error.message)?409:500)).json({error:error.status?error.message:error.code==='23505'?'An account already uses one of these contact details.':'Registration could not be completed.'})}
 });
-router.post(['/login','/auth/login'],async(req,res)=>{const email=String(req.body.email||'').trim().toLowerCase(),password=String(req.body.password||'');if(!email||!password)return res.status(400).json({error:'Email and password are required.'});const rows=await sql.query(`SELECT ${userColumns},password_hash FROM users WHERE LOWER(email)=$1 LIMIT 1`,[email]);const user=rows[0];if(!user?.is_active||!await verifyPassword(password,user?.password_hash))return res.status(401).json({error:'Invalid email or password.'});delete user.password_hash;return res.json({token:tokenFor(user),user})});
+
+router.post('/auth/password-reset/request',async(req,res)=>{
+  const email=normalizeEmail(req.body.email);
+  const generic={message:'If an active account uses that email, a verification code has been sent.'};
+  if(!emailPattern.test(email))return res.status(202).json(generic);
+  const user=(await sql`SELECT id,email,is_active FROM users WHERE LOWER(email)=${email} LIMIT 1`)[0];
+  if(!user?.is_active)return res.status(202).json(generic);
+  const recent=await sql`SELECT created_at FROM notification_verifications WHERE user_id=${user.id} AND channel='EMAIL' AND purpose='PASSWORD_RESET' AND created_at>NOW()-INTERVAL '1 hour' ORDER BY created_at DESC`;
+  if(recent[0]&&Date.now()-new Date(recent[0].created_at).getTime()<60000)return res.status(202).json(generic);
+  if(recent.length>=3)return res.status(202).json(generic);
+  const code=String(crypto.randomInt(100000,1000000)),nonce=crypto.randomBytes(16).toString('hex');
+  const verification=(await sql`INSERT INTO notification_verifications(user_id,channel,destination,purpose,code_hash,nonce,expires_at) VALUES(${user.id},'EMAIL',${email},'PASSWORD_RESET',${codeHash(code,email,nonce)},${nonce},NOW()+INTERVAL '10 minutes') RETURNING id`)[0];
+  try{await sendOtpEmail({to:email,code,purpose:'PASSWORD_RESET',verificationId:verification.id})}catch(error){console.error('Password reset email failed',{userId:user.id,message:error.message})}
+  return res.status(202).json(generic);
+});
+
+router.post('/auth/password-reset/confirm',async(req,res)=>{
+  const email=normalizeEmail(req.body.email),code=String(req.body.code||'').trim(),password=String(req.body.password||'');
+  if(!emailPattern.test(email)||!/^[0-9]{6}$/.test(code)||password.length<12)return res.status(400).json({error:'Enter a valid email, six-digit code, and password of at least 12 characters.'});
+  const verification=(await sql`SELECT * FROM notification_verifications WHERE channel='EMAIL' AND destination=${email} AND purpose='PASSWORD_RESET' AND consumed_at IS NULL ORDER BY id DESC LIMIT 1`)[0];
+  if(!verification||verification.attempts>=5||new Date(verification.expires_at)<=new Date())return res.status(410).json({error:'This verification code has expired. Request a new code.'});
+  if(!safeEqual(codeHash(code,email,verification.nonce),verification.code_hash)){
+    await sql`UPDATE notification_verifications SET attempts=attempts+1 WHERE id=${verification.id}`;
+    return res.status(400).json({error:'Incorrect verification code.'});
+  }
+  const hash=await hashPassword(password);
+  const changed=await sql`WITH consumed AS (UPDATE notification_verifications SET verified_at=COALESCE(verified_at,NOW()),consumed_at=NOW() WHERE id=${verification.id} AND consumed_at IS NULL RETURNING user_id) UPDATE users SET password_hash=${hash},updated_at=NOW() FROM consumed WHERE users.id=consumed.user_id RETURNING users.id`;
+  if(!changed[0])return res.status(409).json({error:'This verification code has already been used.'});
+  return res.json({message:'Password updated. You can now sign in.'});
+});
+
+router.get('/auth/invitations/:token',async(req,res)=>{
+  const invitation=(await sql`SELECT u.first_name,u.last_name,u.email,u.phone,u.whatsapp_number,u.role,i.expires_at FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${hashValue(req.params.token)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
+  return invitation?res.json(invitation):res.status(410).json({error:'This invitation is invalid or expired.'});
+});
+
+router.post('/auth/invitations/accept',async(req,res)=>{
+  const invitationToken=String(req.body.invitation_token||''),password=String(req.body.password||'');
+  if(!invitationToken||password.length<12)return res.status(400).json({error:'A valid invitation and password of at least 12 characters are required.'});
+  const invitation=(await sql`SELECT i.*,u.email,u.phone,u.whatsapp_number FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${hashValue(invitationToken)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
+  if(!invitation)return res.status(410).json({error:'This invitation is invalid or expired.'});
+  const destinations={...(invitation.phone?{SMS:invitation.phone}:{}),...(invitation.whatsapp_number?{WHATSAPP:invitation.whatsapp_number}:{})};
+  try{
+    const challengeIds=[];
+    for(const[channel,destination]of Object.entries(destinations))challengeIds.push(await verifiedProof({token:req.body.verification_tokens?.[channel],channel,destination,purpose:'INVITATION',userId:invitation.user_id}));
+    const hash=await hashPassword(password);
+    const user=(await sql.query(`WITH accepted AS (UPDATE user_invitations SET accepted_at=NOW() WHERE id=$1 AND accepted_at IS NULL RETURNING user_id) UPDATE users SET password_hash=$2,is_active=TRUE,email_verified_at=NOW(),phone_verified_at=CASE WHEN phone IS NULL THEN NULL ELSE NOW() END,whatsapp_verified_at=CASE WHEN whatsapp_number IS NULL THEN NULL ELSE NOW() END,updated_at=NOW() FROM accepted WHERE users.id=accepted.user_id RETURNING ${userColumns}`,[invitation.id,hash]))[0];
+    if(!user)return res.status(409).json({error:'This invitation has already been used.'});
+    if(challengeIds.length)await sql`UPDATE notification_verifications SET consumed_at=NOW() WHERE id=ANY(${challengeIds}::bigint[]) AND consumed_at IS NULL`;
+    return res.json({message:'Invitation accepted.',...(user.role==='CUSTOMER'?{token:tokenFor(user),user}:{})});
+  }catch(error){return res.status(error.status||500).json({error:error.message||'Invitation could not be accepted.'})}
+});
+
+router.post(['/login','/auth/login'],async(req,res)=>{const email=normalizeEmail(req.body.email),password=String(req.body.password||'');if(!email||!password)return res.status(400).json({error:'Email and password are required.'});const rows=await sql.query(`SELECT ${userColumns},password_hash FROM users WHERE LOWER(email)=$1 LIMIT 1`,[email]);const user=rows[0];if(!user?.is_active||!await verifyPassword(password,user?.password_hash))return res.status(401).json({error:'Invalid email or password.'});delete user.password_hash;return res.json({token:tokenFor(user),user})});
 router.get('/auth/session',authenticate,(req,res)=>res.json({user:req.user,expires_at:new Date(req.auth.exp*1000).toISOString()}));
+
+export {assertUniqueContacts,hashValue};
 export default router;

@@ -26,13 +26,15 @@ const currency=()=>String(process.env.STRIPE_CURRENCY||'sgd').toLowerCase();
 const minorUnits=value=>Math.round(Number(value)*100);
 
 const ensurePaidOrderNotification=async orderId=>{
-  const existing=(await sql`SELECT id,status FROM notification_deliveries WHERE order_id=${orderId} AND notification_type='ORDER_SUMMARY' ORDER BY created_at DESC LIMIT 1`)[0];
-  if(existing)return existing;
   const confirmed=(await sql`SELECT * FROM orders WHERE id=${orderId} AND payment_status='PAID'`)[0];
   if(!confirmed)return null;
+  const expected=confirmed.notification_channels?.length?confirmed.notification_channels:[confirmed.notification_channel||'EMAIL'];
+  const delivered=await sql`SELECT DISTINCT channel FROM notification_deliveries WHERE order_id=${orderId} AND notification_type='ORDER_SUMMARY' AND status IN ('ACCEPTED','DELIVERED')`;
+  const completed=new Set(delivered.map(row=>row.channel)),missing=expected.filter(channel=>!completed.has(channel));
+  if(!missing.length)return{status:'ACCEPTED',channels:expected};
   confirmed.items=await sql`SELECT * FROM order_items WHERE order_id=${orderId} ORDER BY id`;
-  const notification=await sendNotificationSummary(confirmed);
-  console.log('Paid order notification processed',{orderId,channel:confirmed.notification_channel,status:notification.status});
+  const notification=await sendNotificationSummary({...confirmed,notification_channels:missing});
+  console.log('Paid order notifications processed',{orderId,channels:missing});
   return notification;
 };
 
@@ -85,7 +87,7 @@ router.get('/checkout-sessions/:sessionId/result',async(req,res)=>{
   const sessionId=String(req.params.sessionId||'').trim();
   if(!/^cs_(?:test_|live_)?[A-Za-z0-9]+$/.test(sessionId))return res.status(400).json({error:'Invalid checkout session.'});
   await releaseExpiredReservations();
-  const result=(await sql`SELECT o.id,o.order_number,o.status,o.payment_status,o.notification_channel FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.stripe_checkout_session_id=${sessionId} ORDER BY p.id DESC LIMIT 1`)[0];
+  const result=(await sql`SELECT o.id,o.order_number,o.status,o.payment_status,o.notification_channel,o.notification_channels FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.stripe_checkout_session_id=${sessionId} ORDER BY p.id DESC LIMIT 1`)[0];
   if(result?.payment_status==='PAID')await ensurePaidOrderNotification(result.id);
   if(result?.payment_status!=='PAID')delete result.order_number;
   if(result)delete result.id;
@@ -147,10 +149,10 @@ router.post('/orders/:id/release',async(req,res)=>{
 
 router.get('/orders/:id/payment',async(req,res)=>{
   await releaseExpiredReservations();
-  const order=(await sql`SELECT id,user_id,order_number,status,notification_channel,notification_destination,payment_method,payment_status FROM orders WHERE id=${req.params.id}`)[0];
+  const order=(await sql`SELECT id,user_id,order_number,status,notification_channel,notification_channels,notification_destination,payment_method,payment_status FROM orders WHERE id=${req.params.id}`)[0];
   if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
   const payment=(await sql`SELECT provider,method,status,amount,currency,paid_at,created_at,updated_at FROM payments WHERE order_id=${order.id} ORDER BY id DESC LIMIT 1`)[0]||null;
-  const result={order_id:order.id,payment_method:order.payment_method,payment_status:order.payment_status,status:order.status,notification_channel:order.notification_channel,payment};
+  const result={order_id:order.id,payment_method:order.payment_method,payment_status:order.payment_status,status:order.status,notification_channel:order.notification_channel,notification_channels:order.notification_channels,payment};
   if(order.payment_status==='PAID')result.order_number=order.order_number;
   return res.json(result);
 });

@@ -6,6 +6,7 @@ import {sendOtpEmail} from './email.js';
 import {normalizeWhatsAppNumber,sendOtpWhatsApp} from './whatsapp.js';
 import {sendOtpSms,verifyOtpSms} from './sms.js';
 import {emailPattern} from './utils.js';
+import {validCheckoutId} from './checkoutPolicy.js';
 
 const router=Router();
 const normalize=(channel,value)=>channel==='EMAIL'?String(value||'').trim().toLowerCase():normalizeWhatsAppNumber(value);
@@ -20,6 +21,7 @@ router.post('/notification-verifications/request',optionalAuthenticate,async(req
   if(purpose==='ACCOUNT_CONTACT_CHANGE'&&!req.user)return res.status(401).json({error:'Authentication required.'});
   if(purpose==='REGISTRATION'&&process.env.REGISTRATION_ENABLED!=='true')return res.status(403).json({error:'New account registration is currently unavailable.'});
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||(channel==='EMAIL'?!emailPattern.test(destination):!destination))return res.status(400).json({error:'A valid email or mobile notification destination is required.'});
+  if(!req.user&&purpose==='CHECKOUT'&&req.body.checkout_id&&!validCheckoutId(req.body.checkout_id))return res.status(400).json({error:'The checkout reference is invalid. Restart checkout and try again.'});
   let verificationUserId=req.user?.id||null;
   if(purpose==='INVITATION'){
     const invitation=(await sql`SELECT i.user_id,u.email,u.phone,u.whatsapp_number FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${tokenHash(req.body.invitation_token)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
@@ -81,6 +83,12 @@ router.post('/notification-verifications/verify',optionalAuthenticate,async(req,
   if(!/^\d+$/.test(id)||!/^\d{6}$/.test(code))return res.status(400).json({error:'A valid verification code is required.'});
   const verification=(await sql`SELECT * FROM notification_verifications WHERE id=${id}`)[0];
   if(!verification||verification.verified_at||verification.consumed_at||verification.superseded_at||new Date(verification.expires_at)<=new Date()||verification.attempts>=5)return res.status(410).json({error:'This verification code has expired. Request a new code.'});
+  if(verification.purpose==='CHECKOUT'){
+    const subjectMatches=verification.subject_type==='CUSTOMER'
+      ?req.user&&String(verification.user_id)===String(req.user.id)&&String(verification.subject_id)===String(req.user.id)
+      :validCheckoutId(req.body.checkout_id)&&String(verification.subject_id)===String(req.body.checkout_id);
+    if(!subjectMatches)return res.status(403).json({error:'This verification does not belong to the current checkout.'});
+  }
   let approved;
   try{approved=verification.channel==='SMS'?await verifyOtpSms({to:verification.destination,code}):safeEqual(codeHash(code,verification.destination,verification.nonce),verification.code_hash)}catch(error){
     console.error('Verification check failed',{channel:verification.channel,providerCode:error.providerCode||error.code||null,status:error.statusCode||null});

@@ -39,6 +39,7 @@ app.use('/api/admin/auth/login',rateLimit({scope:'admin-login',maxAttempts:5,win
 app.use('/api/marketing',rateLimit({scope:'marketing',maxAttempts:5,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
 app.use('/api/contact',rateLimit({scope:'contact',maxAttempts:3,windowSeconds:600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
 app.use('/api/users/phone-availability',rateLimit({scope:'phone-availability',maxAttempts:10,windowSeconds:3600}));
+app.use('/api/users/contact-ownership/check',rateLimit({scope:'contact-ownership-check',maxAttempts:30,windowSeconds:3600}));
 app.use('/api/notification-verifications/request',rateLimit({scope:'verification-request',maxAttempts:10,windowSeconds:3600,value:req=>`${String(req.body?.channel||'').toUpperCase()}:${String(req.body?.destination||'').trim().toLowerCase()}`}));
 app.use('/api/notification-verifications/request',rateLimit({scope:'verification-destination',maxAttempts:5,windowSeconds:3600,value:req=>`${String(req.body?.channel||'').toUpperCase()}:${String(req.body?.destination||'').trim().toLowerCase()}`,includeIp:false}));
 app.use('/api/notification-verifications/verify',rateLimit({scope:'verification-check',maxAttempts:10,windowSeconds:900,value:req=>String(req.body?.verification_id||'')}));

@@ -102,7 +102,6 @@ const checkoutResult=async(req,res)=>{
   return res.json(result);
 };
 router.post('/checkout-sessions/result',checkoutResult);
-router.get('/checkout-sessions/:sessionId/result',(req,res)=>{res.set('Deprecation','true');res.set('Sunset','Wed, 13 Jan 2027 00:00:00 GMT');return checkoutResult(req,res)});
 const canAccessOrder=async(req,order,scope)=>{
   if(req.user&&String(order.user_id)===String(req.user.id))return true;
   return Boolean(await verifyOrderAccessToken(req.get('x-order-access-token'),{orderId:order.id,scope}));

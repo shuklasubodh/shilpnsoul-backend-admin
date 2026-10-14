@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {notificationChannelsFor,returnDeadlineOpen,verificationChannelsFor,verificationMatches} from './checkoutPolicy.js';
+import {normalizeOwnershipContacts,notificationChannelsFor,returnDeadlineOpen,validCheckoutId,verificationChannelsFor,verificationMatches} from './checkoutPolicy.js';
 
 test('email alone requires only email verification',()=>{
   assert.deepEqual(verificationChannelsFor({email:'guest@example.com'}),['EMAIL']);
@@ -27,6 +27,18 @@ test('OTP proof must match both selected channel and exact destination',()=>{
   assert.equal(verificationMatches({claims,channel:'EMAIL',destination:'one@example.com',subjectType:'CUSTOMER'}),false);
   assert.equal(verificationMatches({claims,channel:'EMAIL',destination:'one@example.com',subjectType:'GUEST',subjectId:'checkout-2'}),false);
   assert.equal(verificationMatches({claims,channel:'EMAIL',destination:'one@example.com',subjectType:'GUEST',subjectId:'checkout-1'}),true);
+});
+
+test('contact ownership preflight normalizes all contacts without exposing per-channel results',()=>{
+  assert.deepEqual(normalizeOwnershipContacts({EMAIL:' Guest@Example.com ',SMS:'(+65) 9000 0000',WHATSAPP:'+65 9000 0000'}),{email:'guest@example.com',phones:['+6590000000']});
+  assert.equal(normalizeOwnershipContacts({EMAIL:'not-an-email'}),null);
+  assert.equal(normalizeOwnershipContacts({EMAIL:'guest@example.com',UNKNOWN:'value'}),null);
+});
+
+test('checkout references must be server-shaped UUIDs',()=>{
+  assert.equal(validCheckoutId('4e9cd2f4-c08b-4fe8-a98c-06e903b45d18'),true);
+  assert.equal(validCheckoutId('browser-selected-checkout'),false);
+  assert.equal(validCheckoutId(''),false);
 });
 
 test('return eligibility closes after the configured delivery window',()=>{

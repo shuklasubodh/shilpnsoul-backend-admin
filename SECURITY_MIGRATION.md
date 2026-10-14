@@ -17,15 +17,16 @@ small storefront updates:
    - Store the returned `order_access_token` only for the current tab and send
      it in `x-order-access-token` as before.
 2. Send the `checkout_id` returned by the first checkout-verification request
-   on subsequent checkout-verification requests and in the create-order body.
-   The API remains compatible when it is omitted, but sending it binds every
-   proof to the same checkout.
+   on subsequent checkout-verification requests, verification confirmation,
+   and in the create-order body. It is required for guest checkout and binds
+   every proof to the same checkout.
 3. Inspect invitations with `POST /api/auth/invitations/inspect` and
    `{ "invitation_token": "..." }`. The old token-bearing GET route now
    returns `410` so secrets no longer enter API access-log paths.
-4. Prefer `POST /api/payments/checkout-sessions/result` with
-   `{ "session_id": "..." }`. The existing GET route remains temporarily
-   available. Without the customer bearer token or guest order access token it
+4. Use `POST /api/payments/checkout-sessions/result` with
+   `{ "session_id": "..." }`. The former token-bearing GET route has been
+   removed so Stripe session IDs do not enter API paths or access logs. Without
+   the customer bearer token or guest order access token the POST response
    returns only non-identifying payment/order state; authorized callers also
    receive the order number and notification fields. Remove `session_id` from
    the browser URL immediately after reading it.

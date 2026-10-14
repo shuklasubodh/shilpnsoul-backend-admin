@@ -6,7 +6,7 @@ import {getEmailDeliveryStatus,sendOrderSummary,sendOtpEmail} from './email.js';
 import {normalizeWhatsAppNumber,sendOrderSummaryWhatsApp,sendOtpWhatsApp} from './whatsapp.js';
 import {sendOrderSummarySms,sendOtpSms,verifyOtpSms} from './sms.js';
 import {notFound} from './utils.js';
-import {notificationChannelsFor,returnDeadlineOpen,verificationMatches} from './checkoutPolicy.js';
+import {notificationChannelsFor,returnDeadlineOpen,validCheckoutId,verificationMatches} from './checkoutPolicy.js';
 import {releaseExpiredReservations,reservationMinutes} from './inventoryReservations.js';
 
 const router=Router();
@@ -50,15 +50,17 @@ const verifiedNotifications=async(req,user)=>{
   let channels;
   try{channels=notificationChannelsFor({requestedChannels:requested,availableChannels:Object.keys(destinations)})}catch(error){throw Object.assign(error,{status:400})}
   const challengeIds=[];
+  const checkoutSubjectId=user?String(user.id):String(req.body.checkout_id||'');
+  if(!user&&!validCheckoutId(checkoutSubjectId))throw Object.assign(new Error('A valid checkout reference is required. Verify the contact again.'),{status:403});
   for(const[channel,destination]of Object.entries(destinations)){
     const accountDestination=channel==='EMAIL'?String(user?.email||'').toLowerCase():channel==='SMS'?normalizeWhatsAppNumber(user?.phone):normalizeWhatsAppNumber(user?.whatsapp_number);
     const accountVerified=channel==='EMAIL'?user?.email_verified_at:channel==='SMS'?user?.phone_verified_at:user?.whatsapp_verified_at;
     if(user&&destination===accountDestination&&accountVerified)continue;
     let claims;
     try{claims=verifyNotificationToken(req.body.notification_verification_tokens?.[channel])}catch{throw Object.assign(new Error(`Verify ${channel.toLowerCase()} before placing the order.`),{status:403})}
-    if(!verificationMatches({claims,channel,destination,subjectType:user?'CUSTOMER':'GUEST',subjectId:user?String(user.id):(req.body.checkout_id||undefined)}))throw Object.assign(new Error(`The ${channel.toLowerCase()} verification does not match this checkout.`),{status:403});
+    if(!verificationMatches({claims,channel,destination,subjectType:user?'CUSTOMER':'GUEST',subjectId:checkoutSubjectId}))throw Object.assign(new Error(`The ${channel.toLowerCase()} verification does not match this checkout.`),{status:403});
     const subjectType=user?'CUSTOMER':'GUEST';
-    const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${claims.verification_id} AND channel=${channel} AND destination=${destination} AND purpose='CHECKOUT' AND verified_at IS NOT NULL AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at>NOW() AND subject_type=${subjectType} AND (${user?.id||null}::bigint IS NULL AND user_id IS NULL OR user_id=${user?.id||null})`)[0];
+    const challenge=(await sql`SELECT id FROM notification_verifications WHERE id=${claims.verification_id} AND channel=${channel} AND destination=${destination} AND purpose='CHECKOUT' AND verified_at IS NOT NULL AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at>NOW() AND subject_type=${subjectType} AND subject_id=${checkoutSubjectId} AND (${user?.id||null}::bigint IS NULL AND user_id IS NULL OR user_id=${user?.id||null})`)[0];
     if(!challenge)throw Object.assign(new Error(`${channel} verification is incomplete or already used.`),{status:403});
     challengeIds.push(challenge.id);
   }

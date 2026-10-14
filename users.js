@@ -1,9 +1,10 @@
 import{Router}from'express';
 import crypto from'node:crypto';
 import sql from'./db.js';
-import{authenticate,admin,isAdmin,hashPassword,verifyNotificationToken,verifyPassword}from'./auth.js';
+import{authenticate,admin,isAdmin,hashPassword,optionalAuthenticate,verifyNotificationToken,verifyPassword}from'./auth.js';
 import{sendInvitationEmail}from'./email.js';
 import{emailPattern,normalizeCountryCode,notFound,page,phoneWithCountryCode,userColumns}from'./utils.js';
+import{normalizeOwnershipContacts}from'./checkoutPolicy.js';
 
 const router=Router();
 const contactChangeProof=async({token,channel,destination,userId})=>{
@@ -17,6 +18,19 @@ router.get('/phone-availability',async(req,res)=>{
   const countryCode=normalizeCountryCode(req.query.country_code||'+65'),phone=phoneWithCountryCode(countryCode,req.query.phone);
   if(!countryCode||!phone)return res.status(400).json({error:'Enter a valid country calling code and phone number.'});
   return res.json({available:true,phone,message:'Availability is confirmed securely during registration.'});
+});
+router.post('/contact-ownership/check',optionalAuthenticate,async(req,res)=>{
+  const contacts=normalizeOwnershipContacts(req.body?.contacts);
+  if(!contacts)return res.status(400).json({error:'Supply at least one valid email address or mobile contact.'});
+  const conflict=(await sql.query(`
+    SELECT EXISTS(
+      SELECT 1 FROM users
+      WHERE ($1::bigint IS NULL OR id<>$1)
+        AND (($2::text<>'' AND LOWER(email)=$2) OR (cardinality($3::text[])>0 AND (phone=ANY($3::text[]) OR whatsapp_number=ANY($3::text[]))))
+    ) AS found
+  `,[req.user?.id||null,contacts.email,contacts.phones]))[0]?.found===true;
+  res.set('Cache-Control','no-store');
+  return res.json({available:!conflict,has_conflict:conflict});
 });
 router.use(authenticate);
 router.post('/',admin,async(req,res)=>{

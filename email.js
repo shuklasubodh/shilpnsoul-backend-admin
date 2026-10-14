@@ -32,8 +32,18 @@ const Frame=({preview,title,children})=>h(Html,{lang:'en',dir:'ltr'},h(Head),h(B
     h(Text,{style:{color:colors.muted,fontSize:'13px',lineHeight:'1.5',margin:0}},'Need help? Reply to this email and our team will assist you.')
   )));
 
+const otpPurposeText=purpose=>({
+  REGISTRATION:'Use this code to finish creating your customer account.',
+  PASSWORD_RESET:'Use this code to reset your account password.',
+  INITIAL_ADMIN:'Use this code to authorize creation of the first Shilp & Soul administrator. If you did not start setup, do not share this code.',
+  GUEST_ORDER_ACCESS:'Use this code to securely view your guest order.',
+  ACCOUNT_CONTACT_CHANGE:'Use this code to confirm the new email address on your customer account.',
+  CHECKOUT:'Use this code to confirm email notifications before placing your order.',
+}[purpose]||'Use this code to confirm your email address.');
+const otpSubject=purpose=>({PASSWORD_RESET:'Reset your Shilp & Soul password',GUEST_ORDER_ACCESS:'Your Shilp & Soul guest-order code',ACCOUNT_CONTACT_CHANGE:'Confirm your new Shilp & Soul email'}[purpose]||'Your Shilp & Soul verification code');
+
 const OtpEmail=({code,purpose,expiresMinutes})=>h(Frame,{preview:`Your verification code expires in ${expiresMinutes} minutes.`,title:'Confirm your email address'},
-  h(Text,{style:{fontSize:'16px',lineHeight:'1.6'}},purpose==='REGISTRATION'?'Use this code to finish creating your customer account.':purpose==='PASSWORD_RESET'?'Use this code to reset your account password.':purpose==='INITIAL_ADMIN'?'Use this code to authorize creation of the first Shilp & Soul administrator. If you did not start setup, do not share this code.':'Use this code to confirm email notifications before placing your order.'),
+  h(Text,{style:{fontSize:'16px',lineHeight:'1.6'}},otpPurposeText(purpose)),
   h(Section,{style:{backgroundColor:colors.paper,border:`1px solid ${colors.line}`,padding:'18px',textAlign:'center'}},
     h(Text,{style:{fontFamily:'Courier New, monospace',fontSize:'30px',fontWeight:'700',letterSpacing:'6px',margin:0}},code)),
   h(Text,{style:{color:colors.muted,fontSize:'14px',lineHeight:'1.5'}},`This code expires in ${expiresMinutes} minutes. If you did not request it, you can ignore this email.`));
@@ -78,8 +88,8 @@ export const sendContactMessage=({name,email,subject,message,requestId})=>sendEm
 });
 
 export const sendOtpEmail=({to,code,purpose,verificationId,expiresMinutes=10})=>sendEmail({
-  to,subject:`Your Shilp & Soul verification code`,element:h(OtpEmail,{code,purpose,expiresMinutes}),
-  text:`Your Shilp & Soul verification code is ${code}. It expires in ${expiresMinutes} minutes. If you did not request it, ignore this email.`,
+  to,subject:otpSubject(purpose),element:h(OtpEmail,{code,purpose,expiresMinutes}),
+  text:`${otpPurposeText(purpose)} Your code is ${code}. It expires in ${expiresMinutes} minutes. If you did not request it, ignore this email.`,
   idempotencyKey:`otp/${verificationId}`,tags:[{name:'email_type',value:'otp'}],
 });
 
@@ -102,7 +112,7 @@ export async function sendOrderSummary(order,{resend=false}={}){
     await sql`UPDATE notification_deliveries SET status='ACCEPTED',provider_message_id=${data.id},updated_at=NOW() WHERE id=${delivery.id}`;
     return {status:'ACCEPTED',message_id:data.id};
   }catch(error){
-    await sql`UPDATE notification_deliveries SET status='FAILED',error_message=${String(error.message).slice(0,500)},updated_at=NOW() WHERE id=${delivery.id}`;
+    await sql`UPDATE notification_deliveries SET status='FAILED',error_message='Provider delivery failed',updated_at=NOW() WHERE id=${delivery.id}`;
     return {status:'FAILED'};
   }
 }

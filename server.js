@@ -20,6 +20,7 @@ const defaultOrigins='http://localhost:5173,https://shilnsoul-react-admin.vercel
 
 const normalizeOrigin=value=>String(value||'').trim().replace(/\/$/,'');
 const app=express(),origins=[...new Set(`${defaultOrigins},${process.env.CORS_ORIGINS||''}`.split(',').map(normalizeOrigin).filter(Boolean))];
+app.set('trust proxy',1);
 
 app.disable('x-powered-by');
 app.use((req,res,next)=>{res.set({
@@ -28,6 +29,7 @@ app.use((req,res,next)=>{res.set({
   'Permissions-Policy':'camera=(), microphone=(), geolocation=()',
   'Content-Security-Policy':"default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
 });next()});
+app.use((req,res,next)=>{if(process.env.NODE_ENV==='production')res.set('Strict-Transport-Security','max-age=31536000; includeSubDomains');if(/^\/api\/(?:auth|login|notification-verifications|orders(?:\/|$)|users(?:\/|$)|payments(?:\/|$))/.test(req.path))res.set('Cache-Control','no-store');next()});
 app.use(cors({origin:(origin,callback)=>!origin||origins.includes(normalizeOrigin(origin))?callback(null,true):callback(new Error('CORS origin denied')),exposedHeaders:['X-Total-Count']}));
 app.use('/api/payments/stripe/webhook',stripeWebhook);
 app.use(express.json({limit:'4mb',verify:(req,res,buffer)=>{if(req.originalUrl?.startsWith('/api/whatsapp/webhook'))req.rawBody=Buffer.from(buffer)}}));
@@ -37,7 +39,10 @@ app.use('/api/admin/auth/login',rateLimit({scope:'admin-login',maxAttempts:5,win
 app.use('/api/marketing',rateLimit({scope:'marketing',maxAttempts:5,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
 app.use('/api/contact',rateLimit({scope:'contact',maxAttempts:3,windowSeconds:600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
 app.use('/api/users/phone-availability',rateLimit({scope:'phone-availability',maxAttempts:10,windowSeconds:3600}));
-app.use('/api/notification-verifications/request',rateLimit({scope:'verification-request',maxAttempts:10,windowSeconds:3600}));
+app.use('/api/notification-verifications/request',rateLimit({scope:'verification-request',maxAttempts:10,windowSeconds:3600,value:req=>`${String(req.body?.channel||'').toUpperCase()}:${String(req.body?.destination||'').trim().toLowerCase()}`}));
+app.use('/api/notification-verifications/request',rateLimit({scope:'verification-destination',maxAttempts:5,windowSeconds:3600,value:req=>`${String(req.body?.channel||'').toUpperCase()}:${String(req.body?.destination||'').trim().toLowerCase()}`,includeIp:false}));
+app.use('/api/notification-verifications/verify',rateLimit({scope:'verification-check',maxAttempts:10,windowSeconds:900,value:req=>String(req.body?.verification_id||'')}));
+app.use('/api/orders/track/verify',rateLimit({scope:'guest-order-track-verify',maxAttempts:8,windowSeconds:900,value:req=>String(req.body?.tracking_request_id||req.body?.verification_id||'')}));
 app.use('/api/auth/register',rateLimit({scope:'registration',maxAttempts:5,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
 app.use('/api/auth/password-reset/request',rateLimit({scope:'password-reset-request',maxAttempts:5,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
 app.use('/api/auth/password-reset/confirm',rateLimit({scope:'password-reset-confirm',maxAttempts:8,windowSeconds:3600,value:req=>String(req.body?.email||'').trim().toLowerCase()}));
@@ -45,6 +50,8 @@ app.use('/api/auth/invitations/accept',rateLimit({scope:'invitation-accept',maxA
 app.use('/api/admin/bootstrap/request-code',rateLimit({scope:'initial-admin-request',maxAttempts:5,windowSeconds:3600,blockSeconds:3600}));
 app.use('/api/admin/bootstrap/complete',rateLimit({scope:'initial-admin-complete',maxAttempts:8,windowSeconds:3600,blockSeconds:3600}));
 app.use('/api/orders/track',rateLimit({scope:'guest-order-track',maxAttempts:8,windowSeconds:900,value:req=>String(req.body?.orderNumber||'')}));
+app.use('/api/orders/track',rateLimit({scope:'guest-order-track-target',maxAttempts:5,windowSeconds:3600,value:req=>String(req.body?.tracking_request_id||req.body?.verification_id||req.body?.destination||req.body?.email||req.body?.phone||'').trim().toLowerCase(),includeIp:false}));
+app.use('/api/orders/guest',rateLimit({scope:'guest-order-create',maxAttempts:10,windowSeconds:900,value:req=>String(req.body?.contact_email||'').trim().toLowerCase()}));
 app.use('/api/orders/:id/guest-actions',rateLimit({scope:'guest-order-action',maxAttempts:5,windowSeconds:3600,value:req=>req.params.id}));
 app.use('/api/payments/orders/:id/checkout',rateLimit({scope:'payment-checkout',maxAttempts:10,windowSeconds:900,value:req=>req.params.id}));
 

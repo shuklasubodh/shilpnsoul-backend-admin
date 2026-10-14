@@ -73,7 +73,7 @@ router.post('/whatsapp/webhook',async(req,res)=>{
   for(const status of statuses){
     const mapped=status.status==='failed'?'FAILED':status.status==='delivered'||status.status==='read'?'DELIVERED':'ACCEPTED';
     const error=status.errors?.[0]?.title||status.errors?.[0]?.message||null;
-    await sql`UPDATE notification_deliveries SET status=${mapped},error_message=${error?String(error).slice(0,500):null},updated_at=NOW() WHERE provider='META_WHATSAPP' AND provider_message_id=${status.id}`;
+    await sql`UPDATE notification_deliveries SET status=${mapped},error_message=${error?'Provider delivery failed':null},updated_at=NOW() WHERE provider='META_WHATSAPP' AND provider_message_id=${status.id}`;
   }
   return res.sendStatus(200);
 });

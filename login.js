@@ -35,7 +35,8 @@ const verifiedProof=async({token,channel,destination,purpose,userId=null})=>{
     SELECT id FROM notification_verifications
     WHERE id=${proof.verification_id} AND channel=${channel} AND destination=${destination}
       AND purpose=${purpose} AND verified_at IS NOT NULL AND consumed_at IS NULL
-      AND (${userId}::bigint IS NULL OR user_id=${userId})
+      AND superseded_at IS NULL AND expires_at>NOW()
+      AND ((${userId}::bigint IS NULL AND user_id IS NULL AND subject_type='GUEST') OR user_id=${userId})
   `)[0];
   if(!challenge)throw Object.assign(new Error(`${channel} verification is incomplete or already used.`),{status:403});
   return challenge.id;
@@ -57,9 +58,16 @@ router.post('/auth/register',async(req,res)=>{
     const challengeIds=[];
     for(const[channel,destination]of Object.entries(destinations))challengeIds.push(await verifiedProof({token:req.body.verification_tokens?.[channel],channel,destination,purpose:'REGISTRATION'}));
     const hash=await hashPassword(password);
-    const user=(await sql.query(`INSERT INTO users(first_name,last_name,email,password_hash,country_code,phone,whatsapp_number,role,is_active,email_verified_at,phone_verified_at,whatsapp_verified_at,preferred_notification_channel) VALUES($1,$2,$3,$4,$5,$6,$7,'CUSTOMER',TRUE,NOW(),CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END,CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,$8) RETURNING ${userColumns}`,[firstName,lastName,email,hash,countryCode,phone,whatsappNumber,preferredChannel]))[0];
-    await sql`UPDATE notification_verifications SET consumed_at=NOW() WHERE id=ANY(${challengeIds}::bigint[]) AND consumed_at IS NULL`;
-    return res.status(201).json({token:tokenFor(user),user});
+    const user=(await sql.query(`WITH consumed AS (
+      UPDATE notification_verifications SET consumed_at=NOW()
+      WHERE id=ANY($9::bigint[]) AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at>NOW()
+      RETURNING id
+    ), proofs AS MATERIALIZED (SELECT COUNT(*)=cardinality($9::bigint[]) ok FROM consumed)
+    INSERT INTO users(first_name,last_name,email,password_hash,country_code,phone,whatsapp_number,role,is_active,email_verified_at,phone_verified_at,whatsapp_verified_at,preferred_notification_channel)
+    SELECT $1,$2,$3,$4,$5,$6,$7,'CUSTOMER',TRUE,NOW(),CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END,CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,$8 FROM proofs WHERE proofs.ok
+    RETURNING ${userColumns}`,[firstName,lastName,email,hash,countryCode,phone,whatsappNumber,preferredChannel,challengeIds]))[0];
+    if(!user)return res.status(409).json({error:'A contact verification was already used or expired. Verify again.'});
+    return res.status(201).json({token:await tokenFor(user),user});
   }catch(error){return res.status(error.status||(/already assigned|duplicate/i.test(error.message)?409:500)).json({error:error.status?error.message:error.code==='23505'?'An account already uses one of these contact details.':'Registration could not be completed.'})}
 });
 
@@ -72,9 +80,10 @@ router.post('/auth/password-reset/request',async(req,res)=>{
   const recent=await sql`SELECT created_at FROM notification_verifications WHERE user_id=${user.id} AND channel='EMAIL' AND purpose='PASSWORD_RESET' AND created_at>NOW()-INTERVAL '1 hour' ORDER BY created_at DESC`;
   if(recent[0]&&Date.now()-new Date(recent[0].created_at).getTime()<60000)return res.status(202).json(generic);
   if(recent.length>=3)return res.status(202).json(generic);
+  await sql`UPDATE notification_verifications SET superseded_at=NOW() WHERE user_id=${user.id} AND channel='EMAIL' AND purpose='PASSWORD_RESET' AND consumed_at IS NULL AND superseded_at IS NULL`;
   const code=String(crypto.randomInt(100000,1000000)),nonce=crypto.randomBytes(16).toString('hex');
-  const verification=(await sql`INSERT INTO notification_verifications(user_id,channel,destination,purpose,code_hash,nonce,expires_at) VALUES(${user.id},'EMAIL',${email},'PASSWORD_RESET',${codeHash(code,email,nonce)},${nonce},NOW()+INTERVAL '10 minutes') RETURNING id`)[0];
-  try{await sendOtpEmail({to:email,code,purpose:'PASSWORD_RESET',verificationId:verification.id})}catch(error){console.error('Password reset email failed',{userId:user.id,message:error.message})}
+  const verification=(await sql`INSERT INTO notification_verifications(user_id,channel,destination,purpose,code_hash,nonce,expires_at,subject_type,subject_id,public_id) VALUES(${user.id},'EMAIL',${email},'PASSWORD_RESET',${codeHash(code,email,nonce)},${nonce},NOW()+INTERVAL '10 minutes','CUSTOMER',${String(user.id)},${crypto.randomUUID()}) RETURNING id`)[0];
+  try{await sendOtpEmail({to:email,code,purpose:'PASSWORD_RESET',verificationId:verification.id})}catch(error){console.error('Password reset email failed',{userId:user.id,providerCode:error.providerCode||error.code||null,status:error.statusCode||null})}
   return res.status(202).json(generic);
 });
 
@@ -82,21 +91,26 @@ router.post('/auth/password-reset/confirm',async(req,res)=>{
   const email=normalizeEmail(req.body.email),code=String(req.body.code||'').trim(),password=String(req.body.password||'');
   if(!emailPattern.test(email)||!/^[0-9]{6}$/.test(code)||password.length<12)return res.status(400).json({error:'Enter a valid email, six-digit code, and password of at least 12 characters.'});
   const verification=(await sql`SELECT * FROM notification_verifications WHERE channel='EMAIL' AND destination=${email} AND purpose='PASSWORD_RESET' AND consumed_at IS NULL ORDER BY id DESC LIMIT 1`)[0];
-  if(!verification||verification.attempts>=5||new Date(verification.expires_at)<=new Date())return res.status(410).json({error:'This verification code has expired. Request a new code.'});
+  if(!verification||verification.superseded_at||verification.attempts>=5||new Date(verification.expires_at)<=new Date())return res.status(410).json({error:'This verification code has expired. Request a new code.'});
   if(!safeEqual(codeHash(code,email,verification.nonce),verification.code_hash)){
-    await sql`UPDATE notification_verifications SET attempts=attempts+1 WHERE id=${verification.id}`;
+    await sql`UPDATE notification_verifications SET attempts=attempts+1 WHERE id=${verification.id} AND attempts<5 AND consumed_at IS NULL AND superseded_at IS NULL`;
     return res.status(400).json({error:'Incorrect verification code.'});
   }
   const hash=await hashPassword(password);
-  const changed=await sql`WITH consumed AS (UPDATE notification_verifications SET verified_at=COALESCE(verified_at,NOW()),consumed_at=NOW() WHERE id=${verification.id} AND consumed_at IS NULL RETURNING user_id) UPDATE users SET password_hash=${hash},updated_at=NOW() FROM consumed WHERE users.id=consumed.user_id RETURNING users.id`;
+  const changed=await sql`WITH consumed AS (UPDATE notification_verifications SET verified_at=COALESCE(verified_at,NOW()),consumed_at=NOW() WHERE id=${verification.id} AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at>NOW() AND attempts<5 RETURNING user_id) UPDATE users SET password_hash=${hash},updated_at=NOW() FROM consumed WHERE users.id=consumed.user_id RETURNING users.id`;
   if(!changed[0])return res.status(409).json({error:'This verification code has already been used.'});
   return res.json({message:'Password updated. You can now sign in.'});
 });
 
-router.get('/auth/invitations/:token',async(req,res)=>{
-  const invitation=(await sql`SELECT u.first_name,u.last_name,u.email,u.phone,u.whatsapp_number,u.role,i.expires_at FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${hashValue(req.params.token)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
+const inspectInvitation=async(req,res)=>{
+  const token=String(req.body?.invitation_token||'');
+  if(!token)return res.status(400).json({error:'A valid invitation is required.'});
+  const invitation=(await sql`SELECT u.first_name,u.last_name,u.email,u.phone,u.whatsapp_number,u.role,i.expires_at FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${hashValue(token)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
+  res.set('Cache-Control','no-store');
   return invitation?res.json(invitation):res.status(410).json({error:'This invitation is invalid or expired.'});
-});
+};
+router.post('/auth/invitations/inspect',inspectInvitation);
+router.get('/auth/invitations/:token',(req,res)=>res.status(410).set('Cache-Control','no-store').json({error:'Invitation inspection has moved to POST /api/auth/invitations/inspect.'}));
 
 router.post('/auth/invitations/accept',async(req,res)=>{
   const invitationToken=String(req.body.invitation_token||''),password=String(req.body.password||'');
@@ -108,15 +122,19 @@ router.post('/auth/invitations/accept',async(req,res)=>{
     const challengeIds=[];
     for(const[channel,destination]of Object.entries(destinations))challengeIds.push(await verifiedProof({token:req.body.verification_tokens?.[channel],channel,destination,purpose:'INVITATION',userId:invitation.user_id}));
     const hash=await hashPassword(password);
-    const user=(await sql.query(`WITH accepted AS (UPDATE user_invitations SET accepted_at=NOW() WHERE id=$1 AND accepted_at IS NULL RETURNING user_id) UPDATE users SET password_hash=$2,is_active=TRUE,email_verified_at=NOW(),phone_verified_at=CASE WHEN phone IS NULL THEN NULL ELSE NOW() END,whatsapp_verified_at=CASE WHEN whatsapp_number IS NULL THEN NULL ELSE NOW() END,updated_at=NOW() FROM accepted WHERE users.id=accepted.user_id RETURNING ${userColumns}`,[invitation.id,hash]))[0];
+    const user=(await sql.query(`WITH consumed AS (
+      UPDATE notification_verifications SET consumed_at=NOW() WHERE id=ANY($3::bigint[]) AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at>NOW() RETURNING id
+    ), proofs AS MATERIALIZED (SELECT COUNT(*)=cardinality($3::bigint[]) ok FROM consumed),
+    accepted AS (UPDATE user_invitations SET accepted_at=NOW() FROM proofs WHERE id=$1 AND accepted_at IS NULL AND proofs.ok RETURNING user_id)
+    UPDATE users SET password_hash=$2,is_active=TRUE,email_verified_at=NOW(),phone_verified_at=CASE WHEN phone IS NULL THEN NULL ELSE NOW() END,whatsapp_verified_at=CASE WHEN whatsapp_number IS NULL THEN NULL ELSE NOW() END,updated_at=NOW() FROM accepted WHERE users.id=accepted.user_id RETURNING ${userColumns}`,[invitation.id,hash,challengeIds]))[0];
     if(!user)return res.status(409).json({error:'This invitation has already been used.'});
-    if(challengeIds.length)await sql`UPDATE notification_verifications SET consumed_at=NOW() WHERE id=ANY(${challengeIds}::bigint[]) AND consumed_at IS NULL`;
-    return res.json({message:'Invitation accepted.',...(user.role==='CUSTOMER'?{token:tokenFor(user),user}:{})});
+    return res.json({message:'Invitation accepted.',...(user.role==='CUSTOMER'?{token:await tokenFor(user),user}:{})});
   }catch(error){return res.status(error.status||500).json({error:error.message||'Invitation could not be accepted.'})}
 });
 
-router.post(['/login','/auth/login'],async(req,res)=>{const email=normalizeEmail(req.body.email),password=String(req.body.password||'');if(!email||!password)return res.status(400).json({error:'Email and password are required.'});const rows=await sql.query(`SELECT ${userColumns},password_hash FROM users WHERE LOWER(email)=$1 LIMIT 1`,[email]);const user=rows[0];if(!user?.is_active||!await verifyPassword(password,user?.password_hash))return res.status(401).json({error:'Invalid email or password.'});delete user.password_hash;return res.json({token:tokenFor(user),user})});
+router.post(['/login','/auth/login'],async(req,res)=>{const email=normalizeEmail(req.body.email),password=String(req.body.password||'');if(!email||!password)return res.status(400).json({error:'Email and password are required.'});const rows=await sql.query(`SELECT ${userColumns},password_hash FROM users WHERE LOWER(email)=$1 LIMIT 1`,[email]);const user=rows[0];if(!user?.is_active||!await verifyPassword(password,user?.password_hash))return res.status(401).json({error:'Invalid email or password.'});delete user.password_hash;return res.json({token:await tokenFor(user),user})});
 router.get('/auth/session',authenticate,(req,res)=>res.json({user:req.user,expires_at:new Date(req.auth.exp*1000).toISOString()}));
+router.post('/auth/logout',authenticate,async(req,res)=>{if(req.auth.sid)await sql`UPDATE auth_sessions SET revoked_at=NOW() WHERE session_id=${req.auth.sid} AND user_id=${req.user.id}`;return res.status(204).end()});
 
 export {assertUniqueContacts,hashValue};
 export default router;

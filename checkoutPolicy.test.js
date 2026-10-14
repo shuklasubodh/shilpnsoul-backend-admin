@@ -20,10 +20,13 @@ test('an unavailable optional notification channel is rejected',()=>{
 });
 
 test('OTP proof must match both selected channel and exact destination',()=>{
-  const claims={type:'notification-verification',purpose:'CHECKOUT',channel:'EMAIL',destination:'one@example.com'};
+  const claims={type:'notification-verification',purpose:'CHECKOUT',channel:'EMAIL',destination:'one@example.com',subject_type:'GUEST',subject_id:'checkout-1'};
   assert.equal(verificationMatches({claims,channel:'EMAIL',destination:'one@example.com'}),true);
   assert.equal(verificationMatches({claims,channel:'EMAIL',destination:'two@example.com'}),false);
   assert.equal(verificationMatches({claims,channel:'SMS',destination:'one@example.com'}),false);
+  assert.equal(verificationMatches({claims,channel:'EMAIL',destination:'one@example.com',subjectType:'CUSTOMER'}),false);
+  assert.equal(verificationMatches({claims,channel:'EMAIL',destination:'one@example.com',subjectType:'GUEST',subjectId:'checkout-2'}),false);
+  assert.equal(verificationMatches({claims,channel:'EMAIL',destination:'one@example.com',subjectType:'GUEST',subjectId:'checkout-1'}),true);
 });
 
 test('return eligibility closes after the configured delivery window',()=>{

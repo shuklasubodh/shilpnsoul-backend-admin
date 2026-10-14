@@ -65,16 +65,17 @@ router.post('/admin/bootstrap/request-code',async(req,res,next)=>{
     if(!state||state.status!=='PENDING'||Number(state.user_count)!==0)return res.status(409).json({error:'Initial administrator setup is no longer available.'});
     const recent=(await sql`SELECT created_at FROM notification_verifications WHERE purpose='INITIAL_ADMIN' AND destination=${email} AND created_at>NOW()-INTERVAL '1 hour' ORDER BY created_at DESC`)[0];
     if(recent&&Date.now()-new Date(recent.created_at).getTime()<60000)return res.status(429).json({error:'Please wait before requesting another authorization code.'});
+    await sql`UPDATE notification_verifications SET superseded_at=NOW() WHERE purpose='INITIAL_ADMIN' AND destination=${email} AND consumed_at IS NULL AND superseded_at IS NULL`;
     const code=String(crypto.randomInt(100000,1000000)),nonce=crypto.randomBytes(16).toString('hex');
     const contextHash=bootstrapContextHash({firstName,lastName,email,password},authSecret());
-    const challenge=(await sql`INSERT INTO notification_verifications(channel,destination,purpose,context_hash,code_hash,nonce,expires_at) VALUES('EMAIL',${email},'INITIAL_ADMIN',${contextHash},${codeHash(code,email,nonce)},${nonce},NOW()+INTERVAL '10 minutes') RETURNING id,expires_at`)[0];
+    const challenge=(await sql`INSERT INTO notification_verifications(channel,destination,purpose,context_hash,code_hash,nonce,expires_at,subject_type,subject_id,public_id) VALUES('EMAIL',${email},'INITIAL_ADMIN',${contextHash},${codeHash(code,email,nonce)},${nonce},NOW()+INTERVAL '10 minutes','CUSTOMER','INITIAL_ADMIN',${crypto.randomUUID()}) RETURNING id,expires_at`)[0];
     const delivery=(await sql`INSERT INTO notification_deliveries(verification_id,notification_type,channel,destination,provider,status,idempotency_key) VALUES(${challenge.id},'OTP','EMAIL',${email},'RESEND','PENDING',${`otp/${challenge.id}`}) RETURNING id`)[0];
     try{
       const sent=await sendOtpEmail({to:email,code,purpose:'INITIAL_ADMIN',verificationId:challenge.id});
       await sql`UPDATE notification_deliveries SET status='ACCEPTED',provider_message_id=${sent.id},updated_at=NOW() WHERE id=${delivery.id}`;
     }catch(error){
       await sql`UPDATE notification_verifications SET consumed_at=NOW() WHERE id=${challenge.id}`;
-      await sql`UPDATE notification_deliveries SET status='FAILED',error_message=${String(error.message).slice(0,500)},updated_at=NOW() WHERE id=${delivery.id}`;
+      await sql`UPDATE notification_deliveries SET status='FAILED',error_message='Provider delivery failed',updated_at=NOW() WHERE id=${delivery.id}`;
       throw error;
     }
     return res.status(201).json({challenge_id:challenge.id,expires_at:challenge.expires_at,message:'An authorization code was sent to the configured owner email.'});
@@ -88,10 +89,10 @@ router.post('/admin/bootstrap/complete',async(req,res,next)=>{
     if(!/^\d+$/.test(challengeId)||!/^\d{6}$/.test(code)||!firstName||!lastName||password.length<15)return res.status(400).json({error:'Valid administrator details and a six-digit authorization code are required.'});
     if(!secretMatches(req.body.bootstrap_secret,bootstrapSecret))return res.status(403).json({error:'Initial administrator authorization failed.'});
     const contextHash=bootstrapContextHash({firstName,lastName,email,password},authSecret());
-    const challenge=(await sql`SELECT id,code_hash,nonce,attempts,expires_at FROM notification_verifications WHERE id=${challengeId} AND purpose='INITIAL_ADMIN' AND channel='EMAIL' AND destination=${email} AND context_hash=${contextHash} AND consumed_at IS NULL`)[0];
+    const challenge=(await sql`SELECT id,code_hash,nonce,attempts,expires_at FROM notification_verifications WHERE id=${challengeId} AND purpose='INITIAL_ADMIN' AND channel='EMAIL' AND destination=${email} AND context_hash=${contextHash} AND consumed_at IS NULL AND superseded_at IS NULL`)[0];
     if(!challenge||challenge.attempts>=5||new Date(challenge.expires_at)<=new Date())return res.status(410).json({error:'This authorization code is invalid or expired. Request a new code.'});
     if(!safeEqual(codeHash(code,email,challenge.nonce),challenge.code_hash)){
-      await sql`UPDATE notification_verifications SET attempts=attempts+1 WHERE id=${challenge.id} AND consumed_at IS NULL`;
+      await sql`UPDATE notification_verifications SET attempts=attempts+1 WHERE id=${challenge.id} AND attempts<5 AND consumed_at IS NULL AND superseded_at IS NULL`;
       return res.status(400).json({error:'Incorrect authorization code.'});
     }
     const passwordHash=await hashPassword(password);
@@ -103,7 +104,7 @@ router.post('/admin/bootstrap/complete',async(req,res,next)=>{
       ), challenge AS MATERIALIZED (
         SELECT nv.id FROM notification_verifications nv CROSS JOIN state
         WHERE nv.id=$1 AND nv.purpose='INITIAL_ADMIN' AND nv.channel='EMAIL' AND nv.destination=$2
-          AND nv.context_hash=$3 AND nv.code_hash=$4 AND nv.consumed_at IS NULL
+          AND nv.context_hash=$3 AND nv.code_hash=$4 AND nv.consumed_at IS NULL AND nv.superseded_at IS NULL
           AND nv.attempts<5 AND nv.expires_at>NOW()
         FOR UPDATE OF nv
       ), created AS (

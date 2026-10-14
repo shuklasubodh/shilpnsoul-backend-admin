@@ -48,6 +48,9 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
   try{event=stripe.webhooks.constructEvent(req.body,signature,process.env.STRIPE_WEBHOOK_SECRET)}
   catch{return res.status(400).json({error:'Invalid Stripe signature.'})}
 
+  const replay=(await sql`SELECT event_id FROM stripe_webhook_events WHERE event_id=${event.id}`)[0];
+  if(replay)return res.json({received:true,duplicate:true});
+
   const session=event.data.object;
   if(['checkout.session.completed','checkout.session.async_payment_succeeded'].includes(event.type)){
     const orderId=session.metadata?.order_id;
@@ -78,30 +81,37 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
   }else if(event.type==='checkout.session.async_payment_failed'||event.type==='checkout.session.expired'){
     await sql`UPDATE payments SET status=${event.type.endsWith('expired')?'EXPIRED':'FAILED'},updated_at=NOW() WHERE stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
   }
+  await sql`INSERT INTO stripe_webhook_events(event_id,event_type) VALUES(${event.id},${event.type}) ON CONFLICT(event_id) DO NOTHING`;
   return res.json({received:true});
 });
 
 const router=Router();
 router.use(optionalAuthenticate);
-router.get('/checkout-sessions/:sessionId/result',async(req,res)=>{
-  const sessionId=String(req.params.sessionId||'').trim();
+const checkoutResult=async(req,res)=>{
+  const sessionId=String(req.params.sessionId||req.body?.session_id||'').trim();
   if(!/^cs_(?:test_|live_)?[A-Za-z0-9]+$/.test(sessionId))return res.status(400).json({error:'Invalid checkout session.'});
   await releaseExpiredReservations();
-  const result=(await sql`SELECT o.id,o.order_number,o.status,o.payment_status,o.notification_channel,o.notification_channels FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.stripe_checkout_session_id=${sessionId} ORDER BY p.id DESC LIMIT 1`)[0];
-  if(result?.payment_status==='PAID')await ensurePaidOrderNotification(result.id);
+  const result=(await sql`SELECT o.id,o.user_id,o.order_number,o.status,o.payment_status,o.notification_channel,o.notification_channels FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.stripe_checkout_session_id=${sessionId} ORDER BY p.id DESC LIMIT 1`)[0];
+  if(!result)return notFound(res,'Checkout session');
+  const authorized=await canAccessOrder(req,result,'PAYMENT_READ');
   if(result?.payment_status!=='PAID')delete result.order_number;
   if(result)delete result.id;
-  return result?res.json(result):notFound(res,'Checkout session');
-});
-const canAccessOrder=(req,order)=>{
+  if(result)delete result.user_id;
+  if(!authorized){delete result.order_number;delete result.notification_channel;delete result.notification_channels}
+  res.set('Cache-Control','no-store');
+  return res.json(result);
+};
+router.post('/checkout-sessions/result',checkoutResult);
+router.get('/checkout-sessions/:sessionId/result',(req,res)=>{res.set('Deprecation','true');res.set('Sunset','Wed, 13 Jan 2027 00:00:00 GMT');return checkoutResult(req,res)});
+const canAccessOrder=async(req,order,scope)=>{
   if(req.user&&String(order.user_id)===String(req.user.id))return true;
-  try{const claims=verifyOrderAccessToken(req.get('x-order-access-token'));return claims.type==='guest-order'&&String(claims.sub)===String(order.id)&&claims.destination===order.notification_destination}catch{return false}
+  return Boolean(await verifyOrderAccessToken(req.get('x-order-access-token'),{orderId:order.id,scope}));
 };
 router.post('/orders/:id/checkout',async(req,res)=>{
   await releaseExpiredReservations();
   if(!isId(req.params.id))return notFound(res,'Order');
   const order=(await sql`SELECT id,user_id,order_number,total_amount,contact_email,notification_destination,payment_method,payment_status,status,inventory_reserved_until,inventory_released_at FROM orders WHERE id=${req.params.id}`)[0];
-  if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
+  if(!order||!await canAccessOrder(req,order,'CHECKOUT'))return notFound(res,'Order');
   if(order.payment_status==='PAID')return res.status(409).json({error:'Order is already paid.'});
   if(order.inventory_released_at||!order.inventory_reserved_until||new Date(order.inventory_reserved_until)<=new Date())return res.status(409).json({error:'Your inventory reservation has expired. Return to your bag to check current availability.',code:'RESERVATION_EXPIRED'});
   if(['CANCELLED','CANCEL_REVIEW','RETURN_REVIEW','RETURNED'].includes(order.status))return res.status(409).json({error:'Orders in cancellation or return processing cannot be paid.'});
@@ -135,7 +145,7 @@ router.post('/orders/:id/checkout',async(req,res)=>{
 router.post('/orders/:id/release',async(req,res)=>{
   if(!isId(req.params.id))return notFound(res,'Order');
   const order=(await sql`SELECT id,user_id,notification_destination,payment_status FROM orders WHERE id=${req.params.id}`)[0];
-  if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
+  if(!order||!await canAccessOrder(req,order,'RELEASE'))return notFound(res,'Order');
   if(order.payment_status==='PAID')return res.status(409).json({error:'Paid orders cannot be released.'});
   const sessions=await sql`SELECT stripe_checkout_session_id FROM payments WHERE order_id=${order.id} AND status='PENDING'`;
   const released=await releaseInventoryReservation(order.id,'CUSTOMER_LOGOUT');
@@ -150,7 +160,7 @@ router.post('/orders/:id/release',async(req,res)=>{
 router.get('/orders/:id/payment',async(req,res)=>{
   await releaseExpiredReservations();
   const order=(await sql`SELECT id,user_id,order_number,status,notification_channel,notification_channels,notification_destination,payment_method,payment_status FROM orders WHERE id=${req.params.id}`)[0];
-  if(!order||!canAccessOrder(req,order))return notFound(res,'Order');
+  if(!order||!await canAccessOrder(req,order,'PAYMENT_READ'))return notFound(res,'Order');
   const payment=(await sql`SELECT provider,method,status,amount,currency,paid_at,created_at,updated_at FROM payments WHERE order_id=${order.id} ORDER BY id DESC LIMIT 1`)[0]||null;
   const result={order_id:order.id,payment_method:order.payment_method,payment_status:order.payment_status,status:order.status,notification_channel:order.notification_channel,notification_channels:order.notification_channels,payment};
   if(order.payment_status==='PAID')result.order_number=order.order_number;

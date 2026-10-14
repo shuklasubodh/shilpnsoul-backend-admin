@@ -12,9 +12,11 @@ export const notificationChannelsFor=({requestedChannels=[],availableChannels=[]
   return channels;
 };
 
-export const verificationMatches=({claims,channel,destination,purpose='CHECKOUT'})=>Boolean(
+export const verificationMatches=({claims,channel,destination,purpose='CHECKOUT',subjectType,subjectId})=>Boolean(
   claims&&claims.type==='notification-verification'&&claims.purpose===purpose&&
-  claims.channel===channel&&claims.destination===destination
+  claims.channel===channel&&claims.destination===destination&&
+  (!subjectType||claims.subject_type===subjectType)&&
+  (!subjectId||String(claims.subject_id)===String(subjectId))
 );
 
 export const returnDeadlineOpen=({deliveredAt,windowDays=2,now=Date.now()})=>{

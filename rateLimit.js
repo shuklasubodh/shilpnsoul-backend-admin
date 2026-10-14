@@ -23,9 +23,10 @@ export const consumeRateLimit = async ({ scope, identity, maxAttempts, windowSec
   return !rows[0]?.blocked_until || new Date(rows[0].blocked_until) <= new Date()
 }
 
-export const rateLimit = ({ scope, maxAttempts, windowSeconds, blockSeconds, value = () => '' }) => async (req, res, next) => {
+export const rateLimit = ({ scope, maxAttempts, windowSeconds, blockSeconds, value = () => '', includeIp = true }) => async (req, res, next) => {
   try {
-    const allowed = await consumeRateLimit({ scope, identity: requestIdentity(req, value(req)), maxAttempts, windowSeconds, blockSeconds })
+    const identity=includeIp?requestIdentity(req,value(req)):digest(value(req));
+    const allowed = await consumeRateLimit({ scope, identity, maxAttempts, windowSeconds, blockSeconds })
     if (!allowed) return res.status(429).json({ error: 'Too many requests. Please try again later.' })
     return next()
   } catch (error) {

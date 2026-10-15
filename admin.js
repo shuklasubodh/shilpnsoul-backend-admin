@@ -9,6 +9,38 @@ import { verifyPassword as verifyAccountPassword } from './auth.js'
 
 const BCRYPT_ROUNDS = 12
 const bcryptHashPattern = /^\$2[aby]\$\d{2}\$.{53}$/
+const adminOrderStatuses = ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED']
+let orderStatusConstraintPromise
+
+const ensureOrderStatusConstraint = (sql) => {
+  if (!orderStatusConstraintPromise) {
+    orderStatusConstraintPromise = sql.query(`
+      DO $$
+      BEGIN
+        PERFORM pg_advisory_xact_lock(hashtext('shilpnsoul:orders:status-constraint'));
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'orders'::regclass
+            AND conname = 'chk_orders_status'
+            AND pg_get_constraintdef(oid) LIKE '%PROCESSING%'
+            AND pg_get_constraintdef(oid) LIKE '%DELIVERED%'
+            AND pg_get_constraintdef(oid) LIKE '%CANCEL_REVIEW%'
+            AND pg_get_constraintdef(oid) LIKE '%RETURN_REVIEW%'
+        ) THEN
+          ALTER TABLE orders DROP CONSTRAINT IF EXISTS chk_orders_status;
+          ALTER TABLE orders ADD CONSTRAINT chk_orders_status CHECK (
+            status IN ('PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED',
+                       'CANCEL_REVIEW', 'RETURN_REVIEW', 'CANCELLED', 'RETURNED')
+          );
+        END IF;
+      END $$;
+    `).catch((error) => {
+      orderStatusConstraintPromise = null
+      throw error
+    })
+  }
+  return orderStatusConstraintPromise
+}
 
 const resources = {
   users: {
@@ -820,8 +852,8 @@ export default async function handler(request, response) {
       if (resourceName === 'products' && body.optimize_for_mobile === false) return json(response, 400, { error: 'Mobile image optimization is required for products.' })
       if (resourceName === 'orders' && body.status !== undefined) {
         const status = String(body.status).toUpperCase()
-        const allowed = ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED']
-        if (!allowed.includes(status)) return json(response, 400, { error: 'Invalid order status.' })
+        if (!adminOrderStatuses.includes(status)) return json(response, 400, { error: 'Invalid order status.' })
+        await ensureOrderStatusConstraint(sql)
         const currentRows = await sql.query('SELECT * FROM orders WHERE id = $1', [id])
         if (!currentRows.length) return json(response, 404, { error: 'Record not found.' })
         const current = currentRows[0]

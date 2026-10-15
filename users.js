@@ -41,9 +41,9 @@ router.post('/',admin,async(req,res)=>{
   try{
     user=(await sql.query(`INSERT INTO users(first_name,last_name,email,password_hash,country_code,phone,whatsapp_number,role,is_active,preferred_notification_channel,return_window_days) VALUES($1,$2,$3,$4,$5,$6,$7,$8,FALSE,'EMAIL',$9) RETURNING ${userColumns}`,[first_name,last_name,email,hash,countryCode,phone,whatsapp,role,returnDays]))[0];
     const token=crypto.randomBytes(32).toString('base64url'),tokenHash=crypto.createHash('sha256').update(token).digest('hex');
-    const invitation=(await sql`INSERT INTO user_invitations(user_id,token_hash,expires_at,created_by) VALUES(${user.id},${tokenHash},NOW()+INTERVAL '48 hours',${req.user.id}) RETURNING id`)[0];
+    const invitation=(await sql`INSERT INTO user_invitations(user_id,token_hash,expires_at,created_by) VALUES(${user.id},${tokenHash},NOW()+CASE WHEN ${role}='ADMIN' THEN INTERVAL '1 hour' ELSE INTERVAL '48 hours' END,${req.user.id}) RETURNING id`)[0];
     const appUrl=String(process.env.CUSTOMER_APP_URL||'http://localhost:5173').replace(/\/$/,'');
-    await sendInvitationEmail({to:user.email,name:`${user.first_name} ${user.last_name}`.trim(),invitationUrl:`${appUrl}/?invitation=${encodeURIComponent(token)}`,invitationId:invitation.id});
+    await sendInvitationEmail({to:user.email,name:`${user.first_name} ${user.last_name}`.trim(),invitationUrl:`${appUrl}/#invitation=${encodeURIComponent(token)}`,invitationId:invitation.id});
     return res.status(201).json(user);
   }catch(error){
     if(user?.id)await sql`DELETE FROM users WHERE id=${user.id} AND is_active=FALSE`;
@@ -78,6 +78,7 @@ router.put('/:id',async(req,res)=>{
     updated_at=NOW()
   FROM proofs WHERE id=$12 AND proofs.ok RETURNING ${userColumns}`,[first,last,email,countryCode,phone,whatsapp,role,active,hash,preferred,returnDays,req.params.id,proofIds]);
   if(!rows[0])return res.status(409).json({error:'A contact verification was already used or expired. Verify the changed contact again.'});
+  if(isAdmin(req.user)&&(nextPassword||email!==String(old.email).toLowerCase()||role!==old.role||active!==old.is_active))await sql`UPDATE admin_auth_sessions SET revoked_at=NOW() WHERE user_id=${req.params.id} AND revoked_at IS NULL`;
   return res.json(rows[0]);
 });
 router.delete('/:id',admin,async(req,res)=>{if(String(req.user.id)===req.params.id)return res.status(409).json({error:'Cannot delete yourself.'});const rows=await sql.query(`DELETE FROM users WHERE id=$1 RETURNING ${userColumns}`,[req.params.id]);return rows[0]?res.json(rows[0]):notFound(res,'User')});

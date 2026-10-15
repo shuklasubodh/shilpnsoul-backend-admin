@@ -20,7 +20,8 @@ const defaultOrigins='http://localhost:5173,https://shilnsoul-react-admin.vercel
 
 const normalizeOrigin=value=>String(value||'').trim().replace(/\/$/,'');
 const app=express(),origins=[...new Set(`${defaultOrigins},${process.env.CORS_ORIGINS||''}`.split(',').map(normalizeOrigin).filter(Boolean))];
-app.set('trust proxy',1);
+const configuredProxy=String(process.env.TRUST_PROXY??(process.env.VERCEL?'1':'')).trim();
+if(configuredProxy)app.set('trust proxy',/^\d+$/.test(configuredProxy)?Number(configuredProxy):configuredProxy);
 
 app.disable('x-powered-by');
 app.use((req,res,next)=>{res.set({
@@ -30,7 +31,7 @@ app.use((req,res,next)=>{res.set({
   'Content-Security-Policy':"default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
 });next()});
 app.use((req,res,next)=>{if(process.env.NODE_ENV==='production')res.set('Strict-Transport-Security','max-age=31536000; includeSubDomains');if(/^\/api\/(?:auth|login|notification-verifications|orders(?:\/|$)|users(?:\/|$)|payments(?:\/|$))/.test(req.path))res.set('Cache-Control','no-store');next()});
-app.use(cors({origin:(origin,callback)=>!origin||origins.includes(normalizeOrigin(origin))?callback(null,true):callback(new Error('CORS origin denied')),exposedHeaders:['X-Total-Count']}));
+app.use(cors({origin:(origin,callback)=>!origin||origins.includes(normalizeOrigin(origin))?callback(null,true):callback(new Error('CORS origin denied')),credentials:true,exposedHeaders:['X-Total-Count']}));
 app.use('/api/payments/stripe/webhook',stripeWebhook);
 app.use(express.json({limit:'4mb',verify:(req,res,buffer)=>{if(req.originalUrl?.startsWith('/api/whatsapp/webhook'))req.rawBody=Buffer.from(buffer)}}));
 

@@ -24,10 +24,10 @@ router.post('/notification-verifications/request',optionalAuthenticate,async(req
   if(!req.user&&purpose==='CHECKOUT'&&req.body.checkout_id&&!validCheckoutId(req.body.checkout_id))return res.status(400).json({error:'The checkout reference is invalid. Restart checkout and try again.'});
   let verificationUserId=req.user?.id||null;
   if(purpose==='INVITATION'){
-    const invitation=(await sql`SELECT i.user_id,u.email,u.phone,u.whatsapp_number FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${tokenHash(req.body.invitation_token)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
+    const invitation=(await sql`SELECT i.user_id,u.email,u.phone,u.whatsapp_number,u.role FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${tokenHash(req.body.invitation_token)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
     if(!invitation)return res.status(410).json({error:'This invitation is invalid or expired.'});
     const expected=channel==='EMAIL'?String(invitation.email).toLowerCase():channel==='WHATSAPP'?normalizeWhatsAppNumber(invitation.whatsapp_number):normalizeWhatsAppNumber(invitation.phone);
-    if(channel==='EMAIL'||!expected||destination!==expected)return res.status(403).json({error:'Verify an optional contact included in this invitation.'});
+    if(!expected||destination!==expected||(channel==='EMAIL'&&String(invitation.role).toUpperCase()!=='ADMIN'))return res.status(403).json({error:'Verify a contact required by this invitation.'});
     verificationUserId=invitation.user_id;
   }
   if(!req.user&&purpose==='CHECKOUT'){

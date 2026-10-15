@@ -1,7 +1,7 @@
 import {Router,raw} from 'express';
 import Stripe from 'stripe';
 import sql from './db.js';
-import {admin,optionalAuthenticate,verifyOrderAccessToken} from './auth.js';
+import {admin,authorizeOrderAccess,clearOrderAccessCookie,optionalAuthenticate} from './auth.js';
 import {isId,notFound} from './utils.js';
 import {sendNotificationSummary} from './orders.js';
 import {releaseExpiredReservations,releaseInventoryReservation,reservationMinutes} from './inventoryReservations.js';
@@ -102,15 +102,15 @@ const checkoutResult=async(req,res)=>{
   return res.json(result);
 };
 router.post('/checkout-sessions/result',checkoutResult);
-const canAccessOrder=async(req,order,scope)=>{
+const canAccessOrder=async(req,order,scope,mutation=false)=>{
   if(req.user&&String(order.user_id)===String(req.user.id))return true;
-  return Boolean(await verifyOrderAccessToken(req.get('x-order-access-token'),{orderId:order.id,scope}));
+  return Boolean(await authorizeOrderAccess(req,{orderId:order.id,scope,mutation}));
 };
 router.post('/orders/:id/checkout',async(req,res)=>{
   await releaseExpiredReservations();
   if(!isId(req.params.id))return notFound(res,'Order');
   const order=(await sql`SELECT id,user_id,order_number,total_amount,contact_email,notification_destination,payment_method,payment_status,status,inventory_reserved_until,inventory_released_at FROM orders WHERE id=${req.params.id}`)[0];
-  if(!order||!await canAccessOrder(req,order,'CHECKOUT'))return notFound(res,'Order');
+  if(!order||!await canAccessOrder(req,order,'CHECKOUT',true))return notFound(res,'Order');
   if(order.payment_status==='PAID')return res.status(409).json({error:'Order is already paid.'});
   if(order.inventory_released_at||!order.inventory_reserved_until||new Date(order.inventory_reserved_until)<=new Date())return res.status(409).json({error:'Your inventory reservation has expired. Return to your bag to check current availability.',code:'RESERVATION_EXPIRED'});
   if(['CANCELLED','CANCEL_REVIEW','RETURN_REVIEW','RETURNED'].includes(order.status))return res.status(409).json({error:'Orders in cancellation or return processing cannot be paid.'});
@@ -144,7 +144,7 @@ router.post('/orders/:id/checkout',async(req,res)=>{
 router.post('/orders/:id/release',async(req,res)=>{
   if(!isId(req.params.id))return notFound(res,'Order');
   const order=(await sql`SELECT id,user_id,notification_destination,payment_status FROM orders WHERE id=${req.params.id}`)[0];
-  if(!order||!await canAccessOrder(req,order,'RELEASE'))return notFound(res,'Order');
+  if(!order||!await canAccessOrder(req,order,'RELEASE',true))return notFound(res,'Order');
   if(order.payment_status==='PAID')return res.status(409).json({error:'Paid orders cannot be released.'});
   const sessions=await sql`SELECT stripe_checkout_session_id FROM payments WHERE order_id=${order.id} AND status='PENDING'`;
   const released=await releaseInventoryReservation(order.id,'CUSTOMER_LOGOUT');
@@ -153,6 +153,7 @@ router.post('/orders/:id/release',async(req,res)=>{
     for(const payment of sessions){try{await stripe.checkout.sessions.expire(payment.stripe_checkout_session_id)}catch(error){if(error.code!=='checkout_session_not_open')console.error('Stripe session expiry failed',{orderId:order.id,error:error.message})}}
     await sql`UPDATE payments SET status='EXPIRED',updated_at=NOW() WHERE order_id=${order.id} AND status='PENDING'`;
   }
+  if(!order.user_id)clearOrderAccessCookie(res,order.id);
   return res.json({released:Boolean(released)});
 });
 

@@ -1,7 +1,7 @@
 import {Router} from 'express';
 import crypto from 'node:crypto';
 import sql from './db.js';
-import {authenticate,admin,authSecret,isAdmin,orderAccessTokenFor,verifyNotificationToken,verifyOrderAccessToken} from './auth.js';
+import {authenticate,admin,authSecret,authorizeOrderAccess,isAdmin,orderAccessTokenFor,setOrderAccessCookie,verifyNotificationToken} from './auth.js';
 import {getEmailDeliveryStatus,sendOrderSummary,sendOtpEmail} from './email.js';
 import {normalizeWhatsAppNumber,sendOrderSummaryWhatsApp,sendOtpWhatsApp} from './whatsapp.js';
 import {sendOrderSummarySms,sendOtpSms,verifyOtpSms} from './sms.js';
@@ -155,7 +155,7 @@ const createOrder=async(req,res,user=null)=>{
   if(!order)return res.status(409).json({error:'Inventory changed or a contact verification was already used. Review the order and verify again if needed.'});
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
   order.notification=paymentMethod==='STRIPE'?{status:'PENDING_PAYMENT'}:await sendNotificationSummary(order);
-  if(!user)order.order_access_token=await orderAccessTokenFor(order,{scopes:['CHECKOUT','PAYMENT_READ','RELEASE','READ','RESEND','ACTION'],expiresAt:new Date(new Date(order.inventory_reserved_until).getTime()+15*60*1000)});
+  if(!user){const access=await orderAccessTokenFor(order,{scopes:['CHECKOUT','PAYMENT_READ','RELEASE','READ','RESEND','ACTION'],expiresAt:new Date(new Date(order.inventory_reserved_until).getTime()+15*60*1000)});setOrderAccessCookie(res,order.id,access.token,access.expiresAt);order.order_access_csrf_token=access.csrfToken}
   const response={...order,reservation_minutes:reservationMinutes()};
   if(response.payment_status!=='PAID')delete response.order_number;
   return res.status(201).json(response);
@@ -222,7 +222,7 @@ const createActionRequest=async(req,res,order,requestedByType)=>{
 const guestOrderForAction=async(req)=>{
   const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id IS NULL`)[0];
   if(!order)return null;
-  const access=await verifyOrderAccessToken(req.get('x-order-access-token'),{orderId:order.id,scope:'ACTION',consume:true});
+  const access=await authorizeOrderAccess(req,{orderId:order.id,scope:'ACTION',consume:true,mutation:true});
   return access?order:null;
 };
 
@@ -234,7 +234,9 @@ router.post('/orders/:id/guest-actions',async(req,res)=>{
 const trackedOrderResponse=async(res,order)=>{
   order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
   await sql`UPDATE order_access_grants SET revoked_at=NOW() WHERE order_id=${order.id} AND revoked_at IS NULL AND consumed_at IS NULL`;
-  order.order_access_token=await orderAccessTokenFor(order,{scopes:['READ','RESEND','ACTION'],expiresAt:new Date(Date.now()+30*60*1000)});
+  const access=await orderAccessTokenFor(order,{scopes:['READ','RESEND','ACTION'],expiresAt:new Date(Date.now()+30*60*1000)});
+  setOrderAccessCookie(res,order.id,access.token,access.expiresAt);
+  order.order_access_csrf_token=access.csrfToken;
   res.set('Cache-Control','no-store');
   return res.json(order);
 };
@@ -261,7 +263,7 @@ router.post('/orders/track',async(req,res)=>{
   const destination=channel==='EMAIL'?String(req.body.destination||req.body.email||'').trim().toLowerCase():normalizeWhatsAppNumber(req.body.destination||req.body.phone);
   if(!['EMAIL','WHATSAPP','SMS'].includes(channel)||!destination)return res.status(400).json({error:'Enter the email address or phone number used for order notifications.'});
   const order=(await sql`SELECT * FROM orders WHERE order_number=${orderNumber} AND user_id IS NULL AND ((${channel}='EMAIL' AND LOWER(contact_email)=${destination}) OR (${channel}='SMS' AND contact_phone=${destination}) OR (${channel}='WHATSAPP' AND contact_whatsapp=${destination}))`)[0];
-  if(order&&await verifyOrderAccessToken(req.get('x-order-access-token'),{orderId:order.id,scope:'READ'}))return trackedOrderResponse(res,order);
+  if(order&&await authorizeOrderAccess(req,{orderId:order.id,scope:'READ'}))return trackedOrderResponse(res,order);
   const publicId=crypto.randomUUID(),nonce=crypto.randomBytes(16).toString('hex'),code=String(crypto.randomInt(100000,1000000));
   const storedDestination=order?destination:`invalid:${crypto.createHmac('sha256',authSecret()).update(destination).digest('hex')}`;
   if(order)await sql`UPDATE notification_verifications SET superseded_at=NOW() WHERE purpose='GUEST_ORDER_ACCESS' AND subject_type='GUEST' AND subject_id=${String(order.id)} AND channel=${channel} AND consumed_at IS NULL AND superseded_at IS NULL`;
@@ -279,13 +281,13 @@ router.post('/orders/track',async(req,res)=>{
 });
 router.post('/orders/:id/guest-notifications/resend',async(req,res)=>{
   const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id IS NULL`)[0];
-  const access=order&&await verifyOrderAccessToken(req.get('x-order-access-token'),{orderId:order.id,scope:'RESEND'});
+  const access=order&&await authorizeOrderAccess(req,{orderId:order.id,scope:'RESEND',mutation:true});
   if(!order||!access)return notFound(res,'Order');
   return resendOrderSummary(res,{...order,notification_channels:['EMAIL'],notification_channel:'EMAIL'});
 });
 router.get('/orders/:id/guest-notifications/status',async(req,res)=>{
   const order=(await sql`SELECT * FROM orders WHERE id=${req.params.id} AND user_id IS NULL`)[0];
-  const access=order&&await verifyOrderAccessToken(req.get('x-order-access-token'),{orderId:order.id,scope:'READ'});
+  const access=order&&await authorizeOrderAccess(req,{orderId:order.id,scope:'READ'});
   if(!order||!access)return notFound(res,'Order');
   return orderNotificationStatus(res,order);
 });

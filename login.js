@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import {Router} from 'express';
 import sql from './db.js';
-import {authenticate,authSecret,hashPassword,tokenFor,verifyNotificationToken,verifyPassword} from './auth.js';
+import {authenticate,authSecret,clearCustomerSessionCookie,hashPassword,rotateSessionCsrf,setCustomerSessionCookie,tokenFor,verifyNotificationToken,verifyPassword} from './auth.js';
 import {sendOtpEmail} from './email.js';
 import {emailPattern,normalizeCountryCode,phoneWithCountryCode,userColumns} from './utils.js';
 import {normalizeWhatsAppNumber} from './whatsapp.js';
@@ -67,7 +67,8 @@ router.post('/auth/register',async(req,res)=>{
     SELECT $1,$2,$3,$4,$5,$6,$7,'CUSTOMER',TRUE,NOW(),CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END,CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,$8 FROM proofs WHERE proofs.ok
     RETURNING ${userColumns}`,[firstName,lastName,email,hash,countryCode,phone,whatsappNumber,preferredChannel,challengeIds]))[0];
     if(!user)return res.status(409).json({error:'A contact verification was already used or expired. Verify again.'});
-    return res.status(201).json({token:await tokenFor(user),user});
+    const session=await tokenFor(user);setCustomerSessionCookie(res,session.token);
+    return res.status(201).json({user,csrf_token:session.csrfToken});
   }catch(error){return res.status(error.status||(/already assigned|duplicate/i.test(error.message)?409:500)).json({error:error.status?error.message:error.code==='23505'?'An account already uses one of these contact details.':'Registration could not be completed.'})}
 });
 
@@ -99,6 +100,7 @@ router.post('/auth/password-reset/confirm',async(req,res)=>{
   const hash=await hashPassword(password);
   const changed=await sql`WITH consumed AS (UPDATE notification_verifications SET verified_at=COALESCE(verified_at,NOW()),consumed_at=NOW() WHERE id=${verification.id} AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at>NOW() AND attempts<5 RETURNING user_id) UPDATE users SET password_hash=${hash},updated_at=NOW() FROM consumed WHERE users.id=consumed.user_id RETURNING users.id`;
   if(!changed[0])return res.status(409).json({error:'This verification code has already been used.'});
+  await sql`UPDATE admin_auth_sessions SET revoked_at=NOW() WHERE user_id=${changed[0].id} AND revoked_at IS NULL`;
   return res.json({message:'Password updated. You can now sign in.'});
 });
 
@@ -115,9 +117,9 @@ router.get('/auth/invitations/:token',(req,res)=>res.status(410).set('Cache-Cont
 router.post('/auth/invitations/accept',async(req,res)=>{
   const invitationToken=String(req.body.invitation_token||''),password=String(req.body.password||'');
   if(!invitationToken||password.length<12)return res.status(400).json({error:'A valid invitation and password of at least 12 characters are required.'});
-  const invitation=(await sql`SELECT i.*,u.email,u.phone,u.whatsapp_number FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${hashValue(invitationToken)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
+  const invitation=(await sql`SELECT i.*,u.email,u.phone,u.whatsapp_number,u.role FROM user_invitations i JOIN users u ON u.id=i.user_id WHERE i.token_hash=${hashValue(invitationToken)} AND i.accepted_at IS NULL AND i.expires_at>NOW()`)[0];
   if(!invitation)return res.status(410).json({error:'This invitation is invalid or expired.'});
-  const destinations={...(invitation.phone?{SMS:invitation.phone}:{}),...(invitation.whatsapp_number?{WHATSAPP:invitation.whatsapp_number}:{})};
+  const destinations={...(String(invitation.role).toUpperCase()==='ADMIN'?{EMAIL:String(invitation.email).toLowerCase()}:{}),...(invitation.phone?{SMS:invitation.phone}:{}),...(invitation.whatsapp_number?{WHATSAPP:invitation.whatsapp_number}:{})};
   try{
     const challengeIds=[];
     for(const[channel,destination]of Object.entries(destinations))challengeIds.push(await verifiedProof({token:req.body.verification_tokens?.[channel],channel,destination,purpose:'INVITATION',userId:invitation.user_id}));
@@ -128,13 +130,14 @@ router.post('/auth/invitations/accept',async(req,res)=>{
     accepted AS (UPDATE user_invitations SET accepted_at=NOW() FROM proofs WHERE id=$1 AND accepted_at IS NULL AND proofs.ok RETURNING user_id)
     UPDATE users SET password_hash=$2,is_active=TRUE,email_verified_at=NOW(),phone_verified_at=CASE WHEN phone IS NULL THEN NULL ELSE NOW() END,whatsapp_verified_at=CASE WHEN whatsapp_number IS NULL THEN NULL ELSE NOW() END,updated_at=NOW() FROM accepted WHERE users.id=accepted.user_id RETURNING ${userColumns}`,[invitation.id,hash,challengeIds]))[0];
     if(!user)return res.status(409).json({error:'This invitation has already been used.'});
-    return res.json({message:'Invitation accepted.',...(user.role==='CUSTOMER'?{token:await tokenFor(user),user}:{})});
+    if(user.role==='CUSTOMER'){const session=await tokenFor(user);setCustomerSessionCookie(res,session.token);return res.json({message:'Invitation accepted.',user,csrf_token:session.csrfToken})}
+    return res.json({message:'Invitation accepted.'});
   }catch(error){return res.status(error.status||500).json({error:error.message||'Invitation could not be accepted.'})}
 });
 
-router.post(['/login','/auth/login'],async(req,res)=>{const email=normalizeEmail(req.body.email),password=String(req.body.password||'');if(!email||!password)return res.status(400).json({error:'Email and password are required.'});const rows=await sql.query(`SELECT ${userColumns},password_hash FROM users WHERE LOWER(email)=$1 LIMIT 1`,[email]);const user=rows[0];if(!user?.is_active||!await verifyPassword(password,user?.password_hash))return res.status(401).json({error:'Invalid email or password.'});delete user.password_hash;return res.json({token:await tokenFor(user),user})});
-router.get('/auth/session',authenticate,(req,res)=>res.json({user:req.user,expires_at:new Date(req.auth.exp*1000).toISOString()}));
-router.post('/auth/logout',authenticate,async(req,res)=>{if(req.auth.sid)await sql`UPDATE auth_sessions SET revoked_at=NOW() WHERE session_id=${req.auth.sid} AND user_id=${req.user.id}`;return res.status(204).end()});
+router.post(['/login','/auth/login'],async(req,res)=>{const email=normalizeEmail(req.body.email),password=String(req.body.password||'');if(!email||!password)return res.status(400).json({error:'Email and password are required.'});const rows=await sql.query(`SELECT ${userColumns},password_hash FROM users WHERE LOWER(email)=$1 LIMIT 1`,[email]);const user=rows[0];if(!user?.is_active||!await verifyPassword(password,user?.password_hash))return res.status(401).json({error:'Invalid email or password.'});delete user.password_hash;const session=await tokenFor(user);setCustomerSessionCookie(res,session.token);return res.json({user,csrf_token:session.csrfToken})});
+router.get('/auth/session',authenticate,async(req,res)=>res.json({user:req.user,csrf_token:await rotateSessionCsrf(req.auth.sid),expires_at:new Date(req.auth.exp*1000).toISOString()}));
+router.post('/auth/logout',authenticate,async(req,res)=>{if(req.auth.sid)await sql`UPDATE auth_sessions SET revoked_at=NOW() WHERE session_id=${req.auth.sid} AND user_id=${req.user.id}`;clearCustomerSessionCookie(res);return res.status(204).end()});
 
 export {assertUniqueContacts,hashValue};
 export default router;

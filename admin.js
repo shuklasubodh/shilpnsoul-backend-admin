@@ -1,7 +1,7 @@
 import { neon } from '@neondatabase/serverless'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { handleUpload } from '@vercel/blob/client'
 import { del as deleteBlob, get as getBlob, list as listBlobs, rename as renameBlob } from '@vercel/blob'
 import { sendInvitationEmail } from './email.js'
@@ -283,6 +283,21 @@ export default async function handler(request, response) {
   const route = String(request.query.route || '').replace(/^\/+|\/+$/g, '')
   const [resourceName, id, ...extra] = route.split('/')
   const sql = neon(connectionString)
+  const verifyAdminSession = async rawToken => {
+    const claims = jwt.verify(rawToken || '', authSecret, { algorithms: ['HS256'], issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
+    if (claims.role !== 'ADMIN' || !claims.sid || !/^\d+$/.test(String(claims.sub || claims.id))) throw new Error('Administrator access is required.')
+    const idleMinutes = Math.max(5, Math.min(60, Number(process.env.ADMIN_IDLE_MINUTES) || 15))
+    const rows = await sql.query(`
+      UPDATE admin_auth_sessions AS s SET last_seen_at=NOW()
+      FROM users AS u
+      WHERE s.session_id=$1 AND s.user_id=$2 AND s.revoked_at IS NULL
+        AND s.expires_at>NOW() AND s.last_seen_at>NOW()-($3::int*INTERVAL '1 minute')
+        AND u.id=s.user_id AND u.is_active=TRUE AND UPPER(u.role)='ADMIN'
+      RETURNING s.session_id
+    `, [claims.sid, claims.sub || claims.id, idleMinutes])
+    if (!rows.length) throw new Error('Administrator session is no longer active.')
+    return { ...claims, id: String(claims.sub || claims.id) }
+  }
 
   try {
     if (resourceName === 'blob-upload' && !id && !extra.length && request.method === 'POST') {
@@ -296,8 +311,7 @@ export default async function handler(request, response) {
           body: request.body,
           onBeforeGenerateToken: async (pathname, clientPayload) => {
             const { adminToken, uploadType = 'product' } = parseJson(clientPayload, {})
-            const session = jwt.verify(adminToken || '', authSecret, { algorithms: ['HS256'], issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
-            if (session.role !== 'ADMIN') throw new Error('Administrator access is required.')
+            await verifyAdminSession(adminToken)
             const allowedPrefix = uploadType === 'banner' ? 'banner/' : 'products/'
             if (!String(pathname).startsWith(allowedPrefix)) throw new Error(`Uploads of this type must be stored under ${allowedPrefix}.`)
             return {
@@ -338,7 +352,12 @@ export default async function handler(request, response) {
         await sql.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [migratedHash, user.id])
       }
       const identity = { id: String(user.id), fullName: `${user.first_name} ${user.last_name}`.trim(), email: user.email, role: 'ADMIN' }
-      const token = jwt.sign(identity, authSecret, { algorithm: 'HS256', expiresIn: process.env.ADMIN_JWT_EXPIRES_IN || '8h', issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
+      const sessionId = randomUUID(), sessionHours = Math.max(1, Math.min(24, Number(process.env.ADMIN_SESSION_HOURS) || 8))
+      await sql.query('INSERT INTO admin_auth_sessions(session_id,user_id,expires_at) VALUES($1,$2,NOW()+($3::int*INTERVAL \'1 hour\'))', [sessionId, user.id, sessionHours])
+      const configuredLifetime = String(process.env.ADMIN_JWT_EXPIRES_IN || '30m').trim().match(/^(\d+)(m|h)$/)
+      const configuredMinutes = configuredLifetime ? Number(configuredLifetime[1]) * (configuredLifetime[2] === 'h' ? 60 : 1) : 30
+      const tokenMinutes = Math.max(5, Math.min(60, configuredMinutes))
+      const token = jwt.sign({ ...identity, sid: sessionId }, authSecret, { algorithm: 'HS256', subject: String(user.id), expiresIn: `${tokenMinutes}m`, issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
       return json(response, 200, { token, user: identity })
     }
 
@@ -346,10 +365,14 @@ export default async function handler(request, response) {
     const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : ''
     let adminSession
     try {
-      adminSession = jwt.verify(token, authSecret, { algorithms: ['HS256'], issuer: 'shilpnsoul-admin', audience: 'shilpnsoul-admin-web' })
-      if (adminSession.role !== 'ADMIN') return json(response, 403, { error: 'Administrator access is required.' })
+      adminSession = await verifyAdminSession(token)
     } catch {
       return json(response, 401, { error: 'Authentication is required.' })
+    }
+
+    if (resourceName === 'auth' && id === 'logout' && !extra.length && request.method === 'POST') {
+      await sql.query('UPDATE admin_auth_sessions SET revoked_at=NOW() WHERE session_id=$1 AND user_id=$2', [adminSession.sid, adminSession.id])
+      return response.status(204).end()
     }
 
     if (resourceName === 'order-archive' && id === 'eligible' && !extra.length && request.method === 'GET') {
@@ -780,10 +803,10 @@ export default async function handler(request, response) {
       )
       if (resourceName === 'users') {
         const user=rows[0],token=randomBytes(32).toString('base64url')
-        const invitation=(await sql.query('INSERT INTO user_invitations(user_id,token_hash,expires_at,created_by) VALUES($1,$2,NOW()+INTERVAL \'48 hours\',$3) RETURNING id',[user.id,createHash('sha256').update(token).digest('hex'),adminSession.id]))[0]
+        const invitation=(await sql.query(`INSERT INTO user_invitations(user_id,token_hash,expires_at,created_by) VALUES($1,$2,NOW()+CASE WHEN UPPER($4)='ADMIN' THEN INTERVAL '1 hour' ELSE INTERVAL '48 hours' END,$3) RETURNING id`,[user.id,createHash('sha256').update(token).digest('hex'),adminSession.id,user.role]))[0]
         const appUrl=String(process.env.CUSTOMER_APP_URL||'http://localhost:5173').replace(/\/$/,'')
         try {
-          await sendInvitationEmail({to:user.email,name:`${user.first_name} ${user.last_name}`.trim(),invitationUrl:`${appUrl}/?invitation=${encodeURIComponent(token)}`,invitationId:invitation.id})
+          await sendInvitationEmail({to:user.email,name:`${user.first_name} ${user.last_name}`.trim(),invitationUrl:`${appUrl}/#invitation=${encodeURIComponent(token)}`,invitationId:invitation.id})
         } catch (error) {
           await sql.query('DELETE FROM users WHERE id=$1 AND is_active=FALSE',[user.id])
           throw error
@@ -850,6 +873,7 @@ export default async function handler(request, response) {
         values,
       )
       if (!rows.length) return json(response, 404, { error: 'Record not found.' })
+      if (resourceName === 'users' && columns.some(column => ['password_hash', 'role', 'is_active', 'email'].includes(column))) await sql.query('UPDATE admin_auth_sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL', [id])
       return json(response, 200, { message: 'Record updated successfully.', [resource.responseKey]: publicRecord(resourceName, rows[0]) })
     }
 

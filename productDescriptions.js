@@ -1,7 +1,7 @@
 import {Router} from 'express';
 import path from 'node:path';
 import multer from 'multer';
-import mammoth from 'mammoth';
+import {unzipSync} from 'fflate';
 import ExcelJS from 'exceljs';
 import jwt from 'jsonwebtoken';
 import sql from './db.js';
@@ -43,7 +43,10 @@ export const parseXlsx=async buffer=>{
 };
 
 export const parseDocx=async buffer=>{
-  const {value}=await mammoth.extractRawText({buffer});
+  const archive=unzipSync(new Uint8Array(buffer),{filter:file=>file.name==='word/document.xml'}),document=archive['word/document.xml'];
+  if(!document||document.length>20*1024*1024)throw new Error('The Word document is missing or expands beyond the safe processing limit.');
+  const xml=new TextDecoder().decode(document);
+  const value=xml.replace(/<w:tab\b[^>]*\/>/gi,'\t').replace(/<w:(?:br|cr)\b[^>]*\/>/gi,'\n').replace(/<\/w:p>/gi,'\n').replace(/<[^>]+>/g,'').replace(/&#x([0-9a-f]+);/gi,(_,hex)=>String.fromCodePoint(Number.parseInt(hex,16))).replace(/&#(\d+);/g,(_,number)=>String.fromCodePoint(Number(number))).replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&amp;/g,'&');
   const lines=value.split(/\r?\n/).map(line=>line.trim()).filter(Boolean),records=[];
   const labels=['Product Code','Dimensions','Color','Pattern / Craft','Catalogue Description'];
   const positions=[];
@@ -63,13 +66,14 @@ const validate=rows=>{
   return rows.map((row,index)=>({...row,row_number:index+2,errors:[...(!row.sku?['Product Code is required.']:[]),...(!row.title?['Title is required.']:[]),...(row.sku&&counts.get(row.sku.toLowerCase())>1?['Product Code is duplicated in this document.']:[])]}));
 };
 
-const descriptionAdmin=(req,res,next)=>{
+const descriptionAdmin=async(req,res,next)=>{
   const authorization=String(req.get('authorization')||''),token=authorization.startsWith('Bearer ')?authorization.slice(7):'';
   const adminSecret=String(process.env.ADMIN_JWT_SECRET||'');
   if(token&&adminSecret){
     try{
       const session=jwt.verify(token,adminSecret,{algorithms:['HS256'],issuer:'shilpnsoul-admin',audience:'shilpnsoul-admin-web'});
-      if(session.role==='ADMIN'){req.adminSession=session;return next()}
+      const active=session.role==='ADMIN'&&session.sid&&(await sql`UPDATE admin_auth_sessions s SET last_seen_at=NOW() FROM users u WHERE s.session_id=${session.sid} AND s.user_id=${session.sub||session.id} AND s.revoked_at IS NULL AND s.expires_at>NOW() AND s.last_seen_at>NOW()-((${Math.max(5,Math.min(60,Number(process.env.ADMIN_IDLE_MINUTES)||15))})::int*INTERVAL '1 minute') AND u.id=s.user_id AND u.is_active=TRUE AND UPPER(u.role)='ADMIN' RETURNING s.session_id`)[0];
+      if(active){req.adminSession=session;return next()}
     }catch{/* Try the storefront administrator token below. */}
   }
   return authenticate(req,res,()=>admin(req,res,next));

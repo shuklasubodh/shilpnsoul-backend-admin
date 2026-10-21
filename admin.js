@@ -52,8 +52,8 @@ const resources = {
   },
   products: {
     table: 'products',
-    columns: ['name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'optimize_for_mobile'],
-    publicColumns: ['id', 'name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'optimize_for_mobile', 'created_at', 'updated_at'],
+    columns: ['name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'latest', 'optimize_for_mobile'],
+    publicColumns: ['id', 'name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'latest', 'optimize_for_mobile', 'created_at', 'updated_at'],
     searchColumns: ['name', 'slug', 'sku', 'description', 'place', 'dimension'],
     responseKey: 'product',
   },
@@ -152,6 +152,12 @@ const normalizedResourceBody = (resourceName, source = {}) => {
       return local&&/^\+[1-9]\d{0,3}$/.test(countryCode)?`${countryCode}${local}`:raw
     }
     return {...source,country_code:countryCode,phone:source.phone===undefined?undefined:(international(source.phone)||null),whatsapp_number:source.whatsapp_number===undefined?undefined:(international(source.whatsapp_number)||null)}
+  }
+  if (resourceName === 'products') {
+    const latest = source.latest === undefined
+      ? undefined
+      : ['T', 'TRUE', '1', 'Y'].includes(String(source.latest).trim().toUpperCase()) ? 'T' : 'F'
+    return { ...source, latest }
   }
   if (!['product-descriptions', 'products_desccription'].includes(resourceName)) return source
   return {
@@ -702,12 +708,15 @@ export default async function handler(request, response) {
 
         const incomingImages = productImages(product.image_urls?.length ? product.image_urls : product.image_url)
         const normalizedSku = String(product.sku).trim()
-        const existing = await sql.query('SELECT id, image_url FROM products WHERE LOWER(sku) = LOWER($1) LIMIT 1', [normalizedSku])
+        const existing = await sql.query('SELECT id, image_url, latest FROM products WHERE LOWER(sku) = LOWER($1) LIMIT 1', [normalizedSku])
         const resolvedSlug = await uniqueProductSlug(sql, product.slug, normalizedSku, existing[0]?.id)
+        const latest = product.latest === undefined || String(product.latest).trim() === ''
+          ? existing[0]?.latest || 'F'
+          : ['T', 'TRUE', '1', 'Y'].includes(String(product.latest).trim().toUpperCase()) ? 'T' : 'F'
         const values = [
           String(product.name).trim(), resolvedSlug, normalizedSku, categoryId,
           String(product.description || ''), String(product.place || ''), String(product.dimension || ''), Number(product.price), Math.floor(Number(product.stock_quantity)),
-          JSON.stringify(incomingImages), product.is_active !== false,
+          JSON.stringify(incomingImages), product.is_active !== false, latest,
         ]
         let productId
         let mergedImages = incomingImages
@@ -715,14 +724,14 @@ export default async function handler(request, response) {
           mergedImages = [...new Set([...productImages(existing[0].image_url), ...incomingImages])]
           values[9] = JSON.stringify(mergedImages)
           await sql.query(
-            'UPDATE products SET name = $1, slug = $2, sku = $3, category_id = $4, description = $5, place = $6, dimension = $7, price = $8, stock_quantity = $9, image_url = $10, is_active = $11, updated_at = NOW() WHERE id = $12',
+            'UPDATE products SET name = $1, slug = $2, sku = $3, category_id = $4, description = $5, place = $6, dimension = $7, price = $8, stock_quantity = $9, image_url = $10, is_active = $11, latest = $12, updated_at = NOW() WHERE id = $13',
             [...values, existing[0].id],
           )
           productId = existing[0].id
           productResult.updated += 1
         } else {
           const created = await sql.query(
-            'INSERT INTO products (name, slug, sku, category_id, description, place, dimension, price, stock_quantity, image_url, is_active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id',
+            'INSERT INTO products (name, slug, sku, category_id, description, place, dimension, price, stock_quantity, image_url, is_active, latest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id',
             values,
           )
           productId = created[0].id

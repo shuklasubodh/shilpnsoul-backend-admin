@@ -7,8 +7,10 @@ import { notFound, page } from './utils.js'
 const router = Router()
 const resources = {
   categories: ['name', 'slug', 'description', 'display_order', 'is_active'],
-  products: ['category_id', 'sku', 'name', 'slug', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active'],
+  products: ['category_id', 'sku', 'name', 'slug', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'latest', 'is_active'],
 }
+
+const latestFlag = (value) => ['T', 'TRUE', '1', 'Y'].includes(String(value ?? '').trim().toUpperCase()) ? 'T' : 'F'
 
 const legacyImages = (value) => {
   if (!value) return []
@@ -92,7 +94,7 @@ for (const [name, columns] of Object.entries(resources)) {
   })
 
   router.post(`/${name}`, authenticate, admin, async (req, res) => {
-    const values = columns.map((key) => req.body[key] ?? null)
+    const values = columns.map((key) => key === 'latest' ? latestFlag(req.body[key]) : req.body[key] ?? null)
     const marks = values.map((_, index) => `$${index + 1}`)
     const rows = await sql.query(`INSERT INTO ${name}(${columns.join(',')})VALUES(${marks}) RETURNING *`, values)
     return res.status(201).json(rows[0])
@@ -101,7 +103,7 @@ for (const [name, columns] of Object.entries(resources)) {
   router.put(`/${name}/:id`, authenticate, admin, async (req, res) => {
     const old = (await sql.query(`SELECT * FROM ${name} WHERE id=$1`, [req.params.id]))[0]
     if (!old) return notFound(res, name.slice(0, -1))
-    const values = columns.map((key) => req.body[key] ?? old[key])
+    const values = columns.map((key) => key === 'latest' ? latestFlag(req.body[key] ?? old[key]) : req.body[key] ?? old[key])
     values.push(req.params.id)
     const set = columns.map((key, index) => `${key}=$${index + 1}`).join(',')
     const rows = await sql.query(`UPDATE ${name} SET ${set},updated_at=NOW() WHERE id=$${values.length} RETURNING *`, values)

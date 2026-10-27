@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import {Router} from 'express';
 import sql from './db.js';
-import {authenticate,authSecret,clearCustomerSessionCookie,hashPassword,rotateSessionCsrf,setCustomerSessionCookie,tokenFor,verifyNotificationToken,verifyPassword} from './auth.js';
+import {authenticate,authSecret,clearCustomerSessionCookie,hashPassword,optionalAuthenticate,rotateSessionCsrf,setCustomerSessionCookie,tokenFor,verifyNotificationToken,verifyPassword} from './auth.js';
 import {sendOtpEmail} from './email.js';
 import {emailPattern,normalizeCountryCode,phoneWithCountryCode,userColumns} from './utils.js';
 import {normalizeWhatsAppNumber} from './whatsapp.js';
@@ -140,7 +140,9 @@ router.post('/auth/invitations/accept',async(req,res)=>{
 });
 
 router.post(['/login','/auth/login'],async(req,res)=>{const email=normalizeEmail(req.body.email),password=String(req.body.password||'');if(!email||!password)return res.status(400).json({error:'Email and password are required.'});const rows=await sql.query(`SELECT ${userColumns},password_hash FROM users WHERE LOWER(email)=$1 LIMIT 1`,[email]);const user=rows[0];if(!user?.is_active||!await verifyPassword(password,user?.password_hash))return res.status(401).json({error:'Invalid email or password.'});delete user.password_hash;const session=await tokenFor(user);setCustomerSessionCookie(res,session.token);return res.json({user,csrf_token:session.csrfToken})});
-router.get('/auth/session',authenticate,async(req,res)=>res.json({user:req.user,csrf_token:await rotateSessionCsrf(req.auth.sid),expires_at:new Date(req.auth.exp*1000).toISOString()}));
+router.get('/auth/session',optionalAuthenticate,async(req,res)=>req.user
+  ?res.json({user:req.user,csrf_token:await rotateSessionCsrf(req.auth.sid),expires_at:new Date(req.auth.exp*1000).toISOString()})
+  :res.json({user:null,authenticated:false}));
 router.post('/auth/logout',authenticate,async(req,res)=>{if(req.auth.sid)await sql`UPDATE auth_sessions SET revoked_at=NOW() WHERE session_id=${req.auth.sid} AND user_id=${req.user.id}`;clearCustomerSessionCookie(res);return res.status(204).end()});
 
 export {assertUniqueContacts,hashValue};

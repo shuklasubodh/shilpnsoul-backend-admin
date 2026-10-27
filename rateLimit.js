@@ -20,14 +20,19 @@ export const consumeRateLimit = async ({ scope, identity, maxAttempts, windowSec
       updated_at=NOW()
     RETURNING attempts,blocked_until
   `,[key,windowSeconds,maxAttempts,blockSeconds])
-  return !rows[0]?.blocked_until || new Date(rows[0].blocked_until) <= new Date()
+  const blockedUntil=rows[0]?.blocked_until?new Date(rows[0].blocked_until):null
+  const retryAfterSeconds=blockedUntil?Math.max(0,Math.ceil((blockedUntil.getTime()-Date.now())/1000)):0
+  return {allowed:retryAfterSeconds===0,retryAfterSeconds}
 }
 
 export const rateLimit = ({ scope, maxAttempts, windowSeconds, blockSeconds, value = () => '', includeIp = true }) => async (req, res, next) => {
   try {
     const identity=includeIp?requestIdentity(req,value(req)):digest(value(req));
-    const allowed = await consumeRateLimit({ scope, identity, maxAttempts, windowSeconds, blockSeconds })
-    if (!allowed) return res.status(429).json({ error: 'Too many requests. Please try again later.' })
+    const result = await consumeRateLimit({ scope, identity, maxAttempts, windowSeconds, blockSeconds })
+    if (!result.allowed) {
+      res.set('Retry-After',String(result.retryAfterSeconds))
+      return res.status(429).json({ error: 'Too many requests. Please try again later.', retry_after_seconds: result.retryAfterSeconds })
+    }
     return next()
   } catch (error) {
     console.error('Security rate limit failed',{scope,error:error.message})

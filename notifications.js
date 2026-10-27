@@ -13,6 +13,11 @@ const normalize=(channel,value)=>channel==='EMAIL'?String(value||'').trim().toLo
 const codeHash=(code,destination,nonce)=>crypto.createHmac('sha256',authSecret()).update(`${code}:${destination}:${nonce}`).digest('hex');
 const safeEqual=(left,right)=>{const a=Buffer.from(left),b=Buffer.from(right);return a.length===b.length&&crypto.timingSafeEqual(a,b)};
 const tokenHash=value=>crypto.createHash('sha256').update(String(value)).digest('hex');
+const rateLimited=(res,message,retryAfterSeconds)=>{
+  const seconds=Math.max(1,Math.ceil(retryAfterSeconds));
+  res.set('Retry-After',String(seconds));
+  return res.status(429).json({error:message,retry_after_seconds:seconds});
+};
 
 router.post('/notification-verifications/request',optionalAuthenticate,async(req,res)=>{
   const channel=String(req.body.channel||'').toUpperCase(),purpose=String(req.body.purpose||'').toUpperCase(),destination=normalize(channel,req.body.destination);
@@ -55,8 +60,11 @@ router.post('/notification-verifications/request',optionalAuthenticate,async(req
   if(req.user&&purpose==='CHECKOUT'&&channel==='WHATSAPP'&&destination===normalizeWhatsAppNumber(req.user.whatsapp_number)&&req.user.whatsapp_verified_at)return res.json({verified:true,channel,destination});
 
   const recent=await sql`SELECT nv.created_at FROM notification_verifications nv JOIN notification_deliveries nd ON nd.verification_id=nv.id WHERE nv.channel=${channel} AND nv.destination=${destination} AND nv.created_at>NOW()-INTERVAL '1 hour' AND nd.status IN ('PENDING','ACCEPTED','DELIVERED') ORDER BY nv.created_at DESC`;
-  if(recent[0]&&Date.now()-new Date(recent[0].created_at).getTime()<60000)return res.status(429).json({error:'Please wait before requesting another code.',retry_after_seconds:60-Math.floor((Date.now()-new Date(recent[0].created_at).getTime())/1000)});
-  if(recent.length>=3)return res.status(429).json({error:'Verification code limit reached. Try again in one hour.'});
+  if(recent[0]&&Date.now()-new Date(recent[0].created_at).getTime()<60000)return rateLimited(res,'Please wait before requesting another code.',60-Math.floor((Date.now()-new Date(recent[0].created_at).getTime())/1000));
+  if(recent.length>=3){
+    const oldest=new Date(recent[recent.length-1].created_at).getTime();
+    return rateLimited(res,'Verification code limit reached.',(oldest+60*60*1000-Date.now())/1000);
+  }
 
   const subjectType=verificationUserId?'CUSTOMER':'GUEST',subjectId=verificationUserId?String(verificationUserId):String(req.body.checkout_id||crypto.randomUUID());
   await sql`UPDATE notification_verifications SET superseded_at=NOW() WHERE channel=${channel} AND destination=${destination} AND purpose=${purpose} AND subject_type=${subjectType} AND (${subjectType}='GUEST' OR subject_id=${subjectId}) AND consumed_at IS NULL AND superseded_at IS NULL`;

@@ -259,6 +259,7 @@ const ensureBannersTable = async (sql) => {
       id BIGSERIAL PRIMARY KEY,
       title TEXT NOT NULL DEFAULT '',
       alt_text TEXT NOT NULL DEFAULT '',
+      place_of_origin TEXT NOT NULL DEFAULT '',
       link_url TEXT NOT NULL DEFAULT '',
       blob_url TEXT NOT NULL UNIQUE,
       blob_pathname TEXT NOT NULL UNIQUE CHECK (blob_pathname LIKE 'banner/%'),
@@ -268,7 +269,9 @@ const ensureBannersTable = async (sql) => {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `)
+  await sql.query("ALTER TABLE banners ADD COLUMN IF NOT EXISTS place_of_origin TEXT NOT NULL DEFAULT ''")
   await sql.query('CREATE INDEX IF NOT EXISTS banners_display_idx ON banners(is_active, sort_order, id)')
+  await sql.query('CREATE INDEX IF NOT EXISTS banners_place_of_origin_idx ON banners(place_of_origin, is_active, sort_order)')
 }
 
 const allProductBlobs = async () => {
@@ -487,23 +490,25 @@ export default async function handler(request, response) {
         return json(response, 200, rows)
       }
       if (request.method === 'POST' && !id) {
-        const { title = '', alt_text: altText = '', link_url: linkUrl = '', blob_url: blobUrl, blob_pathname: blobPathname, sort_order: sortOrder = 0, is_active: isActive = true } = request.body || {}
+        const { title = '', alt_text: altText = '', place_of_origin: placeOfOrigin = '', link_url: linkUrl = '', blob_url: blobUrl, blob_pathname: blobPathname, sort_order: sortOrder = 0, is_active: isActive = true } = request.body || {}
         if (!validBlobUrl(blobUrl) || !String(blobPathname || '').startsWith('banner/')) {
           return json(response, 400, { error: 'A valid Vercel Blob image stored under banner/ is required.' })
         }
+        if (!String(placeOfOrigin).trim() || String(placeOfOrigin).trim().length > 120) return json(response, 400, { error: 'A valid place of origin is required.' })
         const rows = await sql.query(`
-          INSERT INTO banners (title, alt_text, link_url, blob_url, blob_pathname, sort_order, is_active)
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          INSERT INTO banners (title, alt_text, place_of_origin, link_url, blob_url, blob_pathname, sort_order, is_active)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
           RETURNING *
-        `, [String(title).trim(), String(altText).trim(), String(linkUrl).trim(), String(blobUrl), String(blobPathname), Math.max(0, Math.floor(Number(sortOrder) || 0)), Boolean(isActive)])
+        `, [String(title).trim(), String(altText).trim(), String(placeOfOrigin).trim(), String(linkUrl).trim(), String(blobUrl), String(blobPathname), Math.max(0, Math.floor(Number(sortOrder) || 0)), Boolean(isActive)])
         return json(response, 201, rows[0])
       }
       if (request.method === 'PUT' && id && positiveId(id)) {
-        const { title = '', alt_text: altText = '', link_url: linkUrl = '', sort_order: sortOrder = 0, is_active: isActive = true } = request.body || {}
+        const { title = '', alt_text: altText = '', place_of_origin: placeOfOrigin = '', link_url: linkUrl = '', sort_order: sortOrder = 0, is_active: isActive = true } = request.body || {}
+        if (!String(placeOfOrigin).trim() || String(placeOfOrigin).trim().length > 120) return json(response, 400, { error: 'A valid place of origin is required.' })
         const rows = await sql.query(`
-          UPDATE banners SET title = $1, alt_text = $2, link_url = $3, sort_order = $4, is_active = $5, updated_at = NOW()
-          WHERE id = $6 RETURNING *
-        `, [String(title).trim(), String(altText).trim(), String(linkUrl).trim(), Math.max(0, Math.floor(Number(sortOrder) || 0)), Boolean(isActive), id])
+          UPDATE banners SET title = $1, alt_text = $2, place_of_origin = $3, link_url = $4, sort_order = $5, is_active = $6, updated_at = NOW()
+          WHERE id = $7 RETURNING *
+        `, [String(title).trim(), String(altText).trim(), String(placeOfOrigin).trim(), String(linkUrl).trim(), Math.max(0, Math.floor(Number(sortOrder) || 0)), Boolean(isActive), id])
         if (!rows.length) return json(response, 404, { error: 'Banner not found.' })
         return json(response, 200, rows[0])
       }

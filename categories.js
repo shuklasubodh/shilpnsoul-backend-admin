@@ -1,7 +1,8 @@
 import { Router } from 'express'
+import crypto from 'node:crypto'
 import sql from './db.js'
 import { releaseExpiredReservations } from './inventoryReservations.js'
-import { authenticate, admin } from './auth.js'
+import { authenticate, optionalAuthenticate, admin } from './auth.js'
 import { notFound, page } from './utils.js'
 
 const router = Router()
@@ -50,20 +51,45 @@ const withProductDetails = async (rows, req) => {
   rows = await withProductImages(rows)
   if (!rows.length) return rows
   const ids = rows.map((row) => row.id)
-  const [colors, descriptions] = await Promise.all([
+  const [colors, descriptions, heartCounts] = await Promise.all([
     sql.query('SELECT id,product_id,color,size,quantity FROM product_color WHERE product_id=ANY($1) ORDER BY product_id,color,size,id', [ids]),
     sql.query('SELECT * FROM product_description WHERE product_id=ANY($1)', [ids]),
+    sql.query('SELECT product_id,COUNT(*)::int trend_count FROM product_hearts WHERE product_id=ANY($1) GROUP BY product_id', [ids]).catch((error) => {
+      if (error.code === '42P01') return []
+      throw error
+    }),
   ])
   const colorsByProduct = new Map()
   for (const color of colors) colorsByProduct.set(String(color.product_id), [...(colorsByProduct.get(String(color.product_id)) || []), color])
   const descriptionsByProduct = new Map(descriptions.map((description) => [String(description.product_id), description]))
+  const heartsByProduct = new Map(heartCounts.map((record) => [String(record.product_id), Number(record.trend_count)]))
   return rows.map((product) => ({
     ...product,
     colors: colorsByProduct.get(String(product.id)) || [],
     product_description: descriptionsByProduct.get(String(product.id)) || null,
+    trend_count: heartsByProduct.get(String(product.id)) || 0,
     description_url: descriptionsByProduct.has(String(product.id)) ? `${req.baseUrl}/products/${product.id}/description` : null,
   }))
 }
+
+router.post('/products/:id/heart', optionalAuthenticate, async (req, res) => {
+  const productId = Number(req.params.id)
+  if (!Number.isSafeInteger(productId) || productId < 1) return res.status(400).json({ error: 'A valid product is required.' })
+  const product = (await sql.query('SELECT id FROM products WHERE id=$1 AND is_active=true', [productId]))[0]
+  if (!product) return notFound(res, 'Product')
+
+  const userId = req.user?.id || null
+  const guestSessionId = String(req.get('x-guest-session-id') || '').trim().toLowerCase()
+  if (!userId && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(guestSessionId)) {
+    return res.status(400).json({ error: 'A valid guest session is required.' })
+  }
+  const guestSessionHash = userId ? null : crypto.createHash('sha256').update(guestSessionId).digest('hex')
+  const inserted = userId
+    ? await sql.query('INSERT INTO product_hearts(product_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING id', [productId, userId])
+    : await sql.query('INSERT INTO product_hearts(product_id,guest_session_hash) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING id', [productId, guestSessionHash])
+  const count = (await sql.query('SELECT COUNT(*)::int trend_count FROM product_hearts WHERE product_id=$1', [productId]))[0].trend_count
+  return res.json({ product_id: productId, trend_count: Number(count), hearted: true, counted: inserted.length > 0 })
+})
 
 router.get('/banners', async (req, res) => {
   const p = page(req.query)

@@ -69,7 +69,11 @@ router.post('/auth/register',async(req,res)=>{
     if(!user)return res.status(409).json({error:'A contact verification was already used or expired. Verify again.'});
     const session=await tokenFor(user);setCustomerSessionCookie(res,session.token);
     return res.status(201).json({user,csrf_token:session.csrfToken});
-  }catch(error){return res.status(error.status||(/already assigned|duplicate/i.test(error.message)?409:500)).json({error:error.status?error.message:error.code==='23505'?'An account already uses one of these contact details.':'Registration could not be completed.'})}
+  }catch(error){
+    const status=error.status||(/already assigned|duplicate/i.test(error.message)?409:500);
+    if(status>=500)console.error('Customer registration failed',{code:error.code||null,constraint:error.constraint||null});
+    return res.status(status).json({error:error.status?error.message:error.code==='23505'?'An account already uses one of these contact details.':'Registration could not be completed.'});
+  }
 });
 
 router.post('/auth/password-reset/request',async(req,res)=>{

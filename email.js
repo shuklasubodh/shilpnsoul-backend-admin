@@ -70,6 +70,10 @@ const ContactEmail=({name,email,subject,message})=>h(Frame,{preview:`New custome
   h(Heading,{as:'h2',style:{fontSize:'18px',margin:'24px 0 8px'}},subject),
   h(Text,{style:{fontSize:'14px',lineHeight:'1.7',whiteSpace:'pre-wrap'}},message));
 
+const MarketingWelcomeEmail=()=>h(Frame,{preview:'You are registered for regular news from Shilp & Soul.',title:'Welcome to Notes from the studio'},
+  h(Text,{style:{fontSize:'16px',lineHeight:'1.6'}},'You are registered for the Shilp & Soul newsletter.'),
+  h(Text,{style:{color:colors.muted,fontSize:'14px',lineHeight:'1.7'}},'You will receive regular updates about new collections, craft stories, artisan work and quiet inspiration from our studio.'));
+
 const sendEmail=async({to,subject,element,text,idempotencyKey,tags,replyTo})=>{
   const html=await render(element);
   const result=await resendClient().emails.send({from:fromAddress(),to:[to],subject,html,text,tags,replyTo},{idempotencyKey});
@@ -85,6 +89,15 @@ export const sendContactMessage=({name,email,subject,message,requestId})=>sendEm
   idempotencyKey:`contact/${requestId}`,
   tags:[{name:'email_type',value:'contact'}],
   replyTo:email,
+});
+
+export const sendMarketingWelcomeEmail=({to,subscriptionId,requestId})=>sendEmail({
+  to,
+  subject:'Welcome to the Shilp & Soul newsletter',
+  element:h(MarketingWelcomeEmail),
+  text:'You are registered for the Shilp & Soul newsletter. You will receive regular updates about new collections, craft stories, artisan work and quiet inspiration from our studio.',
+  idempotencyKey:`marketing-welcome/${subscriptionId}/${requestId}`,
+  tags:[{name:'email_type',value:'marketing_welcome'}],
 });
 
 export const sendOtpEmail=({to,code,purpose,verificationId,expiresMinutes=10})=>sendEmail({

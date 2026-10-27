@@ -12,6 +12,22 @@ const sameSite=()=>{const configured=String(process.env.AUTH_COOKIE_SAME_SITE||'
 const cookieOptions=maxAge=>({httpOnly:true,secure:process.env.NODE_ENV==='production'||sameSite()==='none',sameSite:sameSite(),path:'/api',maxAge});
 const CUSTOMER_COOKIE='shilpnsoul_session';
 const orderCookieName=orderId=>`shilpnsoul_order_${orderId}`;
+let browserSessionSchemaPromise;
+const ensureBrowserSessionSchema=()=>{
+  if(!browserSessionSchemaPromise)browserSessionSchemaPromise=(async()=>{
+    await sql`CREATE TABLE IF NOT EXISTS auth_sessions (
+      session_id TEXT PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      revoked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`;
+    await sql`ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS csrf_token_hash TEXT`;
+    await sql`CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id,expires_at DESC)`;
+  })().catch(error=>{browserSessionSchemaPromise=undefined;throw error});
+  return browserSessionSchemaPromise;
+};
 export const setCustomerSessionCookie=(res,token)=>res.cookie(CUSTOMER_COOKIE,token,cookieOptions(30*60*1000));
 export const clearCustomerSessionCookie=res=>res.clearCookie(CUSTOMER_COOKIE,cookieOptions(0));
 export const setOrderAccessCookie=(res,orderId,token,expiresAt)=>res.cookie(orderCookieName(orderId),token,cookieOptions(Math.max(0,new Date(expiresAt).getTime()-Date.now())));
@@ -22,6 +38,7 @@ export const authSecret=()=>{const configured=process.env.AUTH_SECRET;if(configu
 export async function hashPassword(password){const salt=crypto.randomBytes(16).toString('hex');const key=await scrypt(password,salt,64);return `scrypt$${salt}$${key.toString('hex')}`}
 export async function verifyPassword(password,hash){const stored=String(hash||'');if(/^\$2[aby]\$\d{2}\$.{53}$/.test(stored))return bcrypt.compare(String(password),stored);const [a,salt,want]=stored.split('$');if(a!=='scrypt'||!/^[a-f\d]{32}$/i.test(salt)||!/^[a-f\d]{128}$/i.test(want))return false;const got=await scrypt(password,salt,64);return equal(got.toString('hex'),want)}
 export async function tokenFor(user){
+  await ensureBrowserSessionSchema();
   const sessionId=crypto.randomUUID(),csrfToken=crypto.randomBytes(32).toString('base64url'),sessionHours=Math.max(1,Math.min(168,Number(process.env.CUSTOMER_SESSION_HOURS)||24));
   const expiresAt=new Date(Date.now()+sessionHours*60*60*1000);
   await sql`INSERT INTO auth_sessions(session_id,user_id,csrf_token_hash,expires_at) VALUES(${sessionId},${user.id},${tokenHash(csrfToken)},${expiresAt})`;

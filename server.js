@@ -56,6 +56,7 @@ app.use('/api/orders/track',rateLimit({scope:'guest-order-track-target',maxAttem
 app.use('/api/orders/guest',rateLimit({scope:'guest-order-create',maxAttempts:10,windowSeconds:900,value:req=>String(req.body?.contact_email||'').trim().toLowerCase()}));
 app.use('/api/orders/:id/guest-actions',rateLimit({scope:'guest-order-action',maxAttempts:5,windowSeconds:3600,value:req=>req.params.id}));
 app.use('/api/payments/orders/:id/checkout',rateLimit({scope:'payment-checkout',maxAttempts:10,windowSeconds:900,value:req=>req.params.id}));
+app.use('/api/products/:id/heart',rateLimit({scope:'product-heart',maxAttempts:60,windowSeconds:3600,value:req=>`${req.params.id}:${String(req.get('x-guest-session-id')||'').trim().toLowerCase()}`}));
 
 app.use('/api',bootstrap);
 app.use('/api/admin',productDescriptions);

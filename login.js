@@ -16,14 +16,14 @@ const optionalPhone=(countryCode,value)=>String(value||'').trim()?normalizeWhats
 const optionalWhatsApp=value=>String(value||'').trim()?normalizeWhatsAppNumber(value):null;
 
 const assertUniqueContacts=async({email,phone,whatsapp,userId=null})=>{
-  const duplicate=(await sql`
+  const duplicate=(await sql.query(`
     SELECT id FROM users
-    WHERE (${userId}::bigint IS NULL OR id<>${userId})
-      AND (LOWER(email)=${email}
-        OR (${phone}::text IS NOT NULL AND (phone=${phone} OR whatsapp_number=${phone}))
-        OR (${whatsapp}::text IS NOT NULL AND (phone=${whatsapp} OR whatsapp_number=${whatsapp})))
+    WHERE ($4::bigint IS NULL OR id<>$4)
+      AND (LOWER(email)=$1::text
+        OR ($2::text IS NOT NULL AND (phone=$2::text OR whatsapp_number=$2::text))
+        OR ($3::text IS NOT NULL AND (phone=$3::text OR whatsapp_number=$3::text)))
     LIMIT 1
-  `)[0];
+  `,[email,phone,whatsapp,userId]))[0];
   if(duplicate)throw Object.assign(new Error('An account already uses one of these contact details.'),{status:409});
 };
 
@@ -31,13 +31,13 @@ const verifiedProof=async({token,channel,destination,purpose,userId=null})=>{
   let proof;
   try{proof=verifyNotificationToken(token)}catch{throw Object.assign(new Error(`Verify ${channel.toLowerCase()} before continuing.`),{status:403})}
   if(proof.type!=='notification-verification'||proof.purpose!==purpose||proof.channel!==channel||proof.destination!==destination)throw Object.assign(new Error(`The ${channel.toLowerCase()} verification does not match.`),{status:403});
-  const challenge=(await sql`
+  const challenge=(await sql.query(`
     SELECT id FROM notification_verifications
-    WHERE id=${proof.verification_id} AND channel=${channel} AND destination=${destination}
-      AND purpose=${purpose} AND verified_at IS NOT NULL AND consumed_at IS NULL
+    WHERE id=$1::bigint AND channel=$2::text AND destination=$3::text
+      AND purpose=$4::text AND verified_at IS NOT NULL AND consumed_at IS NULL
       AND superseded_at IS NULL AND expires_at>NOW()
-      AND ((${userId}::bigint IS NULL AND user_id IS NULL AND subject_type='GUEST') OR user_id=${userId})
-  `)[0];
+      AND (($5::bigint IS NULL AND user_id IS NULL AND subject_type='GUEST') OR user_id=$5::bigint)
+  `,[proof.verification_id,channel,destination,purpose,userId]))[0];
   if(!challenge)throw Object.assign(new Error(`${channel} verification is incomplete or already used.`),{status:403});
   return challenge.id;
 };

@@ -53,25 +53,29 @@ router.post('/auth/register',async(req,res)=>{
   if(String(req.body.whatsapp_number||'').trim()&&!whatsappNumber)return res.status(400).json({error:'Enter a valid WhatsApp number.'});
   const destinations={EMAIL:email,...(phone?{SMS:phone}:{}),...(whatsappNumber?{WHATSAPP:whatsappNumber}:{})};
   if(!destinations[preferredChannel])return res.status(400).json({error:'The preferred notification channel must have a supplied contact.'});
+  let registrationStage='contact-check';
   try{
     await assertUniqueContacts({email,phone,whatsapp:whatsappNumber});
+    registrationStage='verification-proof';
     const challengeIds=[];
     for(const[channel,destination]of Object.entries(destinations))challengeIds.push(await verifiedProof({token:req.body.verification_tokens?.[channel],channel,destination,purpose:'REGISTRATION'}));
     const hash=await hashPassword(password);
+    registrationStage='user-insert';
     const user=(await sql.query(`WITH consumed AS (
       UPDATE notification_verifications SET consumed_at=NOW()
       WHERE id=ANY($9::bigint[]) AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at>NOW()
       RETURNING id
     ), proofs AS MATERIALIZED (SELECT COUNT(*)=cardinality($9::bigint[]) ok FROM consumed)
     INSERT INTO users(first_name,last_name,email,password_hash,country_code,phone,whatsapp_number,role,is_active,email_verified_at,phone_verified_at,whatsapp_verified_at,preferred_notification_channel)
-    SELECT $1,$2,$3,$4,$5,$6,$7,'CUSTOMER',TRUE,NOW(),CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END,CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,$8 FROM proofs WHERE proofs.ok
+    SELECT $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,'CUSTOMER',TRUE,NOW(),CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END,CASE WHEN $7::text IS NULL THEN NULL ELSE NOW() END,$8::text FROM proofs WHERE proofs.ok
     RETURNING ${userColumns}`,[firstName,lastName,email,hash,countryCode,phone,whatsappNumber,preferredChannel,challengeIds]))[0];
     if(!user)return res.status(409).json({error:'A contact verification was already used or expired. Verify again.'});
+    registrationStage='session';
     const session=await tokenFor(user);setCustomerSessionCookie(res,session.token);
     return res.status(201).json({user,csrf_token:session.csrfToken});
   }catch(error){
     const status=error.status||(/already assigned|duplicate/i.test(error.message)?409:500);
-    if(status>=500)console.error('Customer registration failed',{code:error.code||null,constraint:error.constraint||null});
+    if(status>=500)console.error('Customer registration failed',{stage:registrationStage,code:error.code||null,constraint:error.constraint||null,position:error.position||null,message:error.message||null});
     return res.status(status).json({error:error.status?error.message:error.code==='23505'?'An account already uses one of these contact details.':'Registration could not be completed.'});
   }
 });

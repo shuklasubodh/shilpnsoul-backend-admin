@@ -8,8 +8,10 @@ import {sendOrderSummarySms,sendOtpSms,verifyOtpSms} from './sms.js';
 import {notFound} from './utils.js';
 import {notificationChannelsFor,returnDeadlineOpen,validCheckoutId,verificationMatches} from './checkoutPolicy.js';
 import {releaseExpiredReservations,reservationMinutes} from './inventoryReservations.js';
+import {ensureProductVariantSchema} from './productVariants.js';
 
 const router=Router();
+router.use(async(req,res,next)=>{try{await ensureProductVariantSchema();return next()}catch(error){return next(error)}});
 const codeHash=(code,destination,nonce)=>crypto.createHmac('sha256',authSecret()).update(`${code}:${destination}:${nonce}`).digest('hex');
 const safeEqual=(left,right)=>{const a=Buffer.from(String(left)),b=Buffer.from(String(right));return a.length===b.length&&crypto.timingSafeEqual(a,b)};
 
@@ -84,15 +86,17 @@ const createOrder=async(req,res,user=null)=>{
   const requested=new Map();
   let total=0;
   for(const item of items){
-    const product=(await sql`SELECT p.*,pc.id product_color_id,pc.color,pc.quantity color_quantity,EXISTS(SELECT 1 FROM product_color x WHERE x.product_id=p.id) has_colors FROM products p LEFT JOIN product_color pc ON pc.product_id=p.id AND pc.id=${item.product_color_id} WHERE p.id=${item.product_id} AND p.is_active=true`)[0];
+    const product=(await sql`SELECT p.*,pc.id product_color_id,pc.color,pc.size,pc.quantity variant_quantity FROM products p LEFT JOIN product_color pc ON pc.product_id=p.id AND pc.id=${item.product_color_id} WHERE p.id=${item.product_id} AND p.is_active=true`)[0];
     const quantity=Number(item.quantity);
     if(!product||!Number.isInteger(quantity)||quantity<1)return res.status(409).json({error:'Product or quantity is invalid.'});
-    if(product.has_colors&&!product.product_color_id)return res.status(409).json({error:`Select an available color for ${product.name}.`});
-    if(!product.has_colors&&item.product_color_id!=null)return res.status(409).json({error:`${product.name} does not have a color option.`});
-    const available=Number(product.has_colors?product.color_quantity:product.stock_quantity);
-    if(quantity>available)return res.status(409).json({error:`Insufficient stock for ${product.name}${product.color?` (${product.color})`:''}.`});
-    const key=product.product_color_id?`color:${product.product_color_id}`:`product:${product.id}`,existing=requested.get(key);
-    requested.set(key,{product_id:product.id,product_color_id:product.product_color_id||null,quantity:(existing?.quantity||0)+quantity,product_name:product.name,color:product.color||null,unit_price:Number(product.price)});
+    const requiresVariant=product.variant_type!=='NONE';
+    if(requiresVariant&&!product.product_color_id)return res.status(409).json({error:`Select the required options for ${product.name}.`});
+    if(!requiresVariant&&item.product_color_id!=null)return res.status(409).json({error:`${product.name} does not have color or size options.`});
+    const available=Number(requiresVariant?product.variant_quantity:product.stock_quantity);
+    const option=[product.color,product.size].filter(Boolean).join(' / ');
+    if(quantity>available)return res.status(409).json({error:`Insufficient stock for ${product.name}${option?` (${option})`:''}.`});
+    const key=product.product_color_id?`variant:${product.product_color_id}`:`product:${product.id}`,existing=requested.get(key);
+    requested.set(key,{product_id:product.id,product_color_id:product.product_color_id||null,quantity:(existing?.quantity||0)+quantity,product_name:product.name,color:product.color||null,size:product.size||null,unit_price:Number(product.price)});
   }
   const prepared=[...requested.values()];
   const subtotal=prepared.reduce((sum,item)=>sum+item.unit_price*item.quantity,0);
@@ -112,7 +116,7 @@ const createOrder=async(req,res,user=null)=>{
           AND (LOWER(email)=LOWER($8) OR ($9::text IS NOT NULL AND (phone=$9 OR whatsapp_number=$9)) OR ($15::text IS NOT NULL AND (phone=$15 OR whatsapp_number=$15)))
       ) ok
     ), requested AS MATERIALIZED (
-      SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(product_id bigint,product_color_id bigint,quantity integer,product_name text,color text,unit_price numeric)
+      SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(product_id bigint,product_color_id bigint,quantity integer,product_name text,color text,size text,unit_price numeric)
     ), locked_colors AS MATERIALIZED (
       SELECT pc.id,pc.product_id,pc.quantity available,r.quantity requested_quantity
       FROM product_color pc JOIN requested r ON r.product_color_id=pc.id AND r.product_id=pc.product_id
@@ -144,8 +148,8 @@ const createOrder=async(req,res,user=null)=>{
       SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$15,$10,'UNPAID',$11,$12,$14,NOW(),NOW()+($16::int*INTERVAL '1 minute'),$17 FROM eligible,proofs_ok,contacts_ok WHERE eligible.ok AND proofs_ok.ok AND contacts_ok.ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
       RETURNING *
     ), new_items AS (
-      INSERT INTO order_items(order_id,product_id,product_color_id,color,product_name,quantity,unit_price,subtotal)
-      SELECT o.id,r.product_id,r.product_color_id,r.color,r.product_name,r.quantity,r.unit_price,r.quantity*r.unit_price FROM new_order o CROSS JOIN requested r RETURNING id
+      INSERT INTO order_items(order_id,product_id,product_color_id,color,size,product_name,quantity,unit_price,subtotal)
+      SELECT o.id,r.product_id,r.product_color_id,r.color,r.size,r.product_name,r.quantity,r.unit_price,r.quantity*r.unit_price FROM new_order o CROSS JOIN requested r RETURNING id
     ), new_event AS (
       INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id)
       SELECT id,'ORDER_CREATED','PENDING','UNPAID',$13,$2 FROM new_order RETURNING id

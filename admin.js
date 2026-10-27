@@ -6,6 +6,7 @@ import { handleUpload } from '@vercel/blob/client'
 import { del as deleteBlob, get as getBlob, list as listBlobs, rename as renameBlob } from '@vercel/blob'
 import { sendInvitationEmail } from './email.js'
 import { verifyPassword as verifyAccountPassword } from './auth.js'
+import { ensureProductVariantSchema } from './productVariants.js'
 
 const BCRYPT_ROUNDS = 12
 const bcryptHashPattern = /^\$2[aby]\$\d{2}\$.{53}$/
@@ -52,8 +53,8 @@ const resources = {
   },
   products: {
     table: 'products',
-    columns: ['name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'latest', 'optimize_for_mobile'],
-    publicColumns: ['id', 'name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'latest', 'optimize_for_mobile', 'created_at', 'updated_at'],
+    columns: ['name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'latest', 'variant_type', 'optimize_for_mobile'],
+    publicColumns: ['id', 'name', 'slug', 'sku', 'category_id', 'description', 'place', 'dimension', 'price', 'stock_quantity', 'image_url', 'is_active', 'latest', 'variant_type', 'optimize_for_mobile', 'created_at', 'updated_at'],
     searchColumns: ['name', 'slug', 'sku', 'description', 'place', 'dimension'],
     responseKey: 'product',
   },
@@ -157,7 +158,12 @@ const normalizedResourceBody = (resourceName, source = {}) => {
     const latest = source.latest === undefined
       ? undefined
       : ['T', 'TRUE', '1', 'Y'].includes(String(source.latest).trim().toUpperCase()) ? 'T' : 'F'
-    return { ...source, latest }
+    const variantType = source.variant_type === undefined ? undefined : String(source.variant_type).trim().toUpperCase()
+    return {
+      ...source,
+      latest,
+      variant_type: variantType === undefined ? undefined : ['COLOR', 'SIZE', 'BOTH', 'NONE'].includes(variantType) ? variantType : 'NONE',
+    }
   }
   if (!['product-descriptions', 'products_desccription'].includes(resourceName)) return source
   return {
@@ -166,6 +172,21 @@ const normalizedResourceBody = (resourceName, source = {}) => {
     color_description: source.color_description ?? source.color ?? source.colour,
     catalogue_description: source.catalogue_description ?? source.description,
   }
+}
+
+const normalizeProductVariantRecord = async (sql, source, current = {}) => {
+  const productId = source.product_id ?? current.product_id
+  const product = (await sql.query('SELECT id,variant_type FROM products WHERE id=$1', [productId]))[0]
+  if (!product) return { error: 'A valid product is required.' }
+  const variantType = String(product.variant_type || 'NONE').toUpperCase()
+  const color = String(source.color ?? current.color ?? '').trim()
+  const size = String(source.size ?? current.size ?? '').trim()
+  const quantity = Number(source.quantity ?? current.quantity)
+  if (variantType === 'NONE') return { error: 'This product does not use color or size variants.' }
+  if ((variantType === 'COLOR' || variantType === 'BOTH') && !color) return { error: 'Color is required for this product.' }
+  if ((variantType === 'SIZE' || variantType === 'BOTH') && !size) return { error: 'Size is required for this product.' }
+  if (!Number.isInteger(quantity) || quantity < 0) return { error: 'A non-negative whole-number quantity is required.' }
+  return { ...source, product_id: product.id, color: variantType === 'SIZE' ? '' : color, size: variantType === 'COLOR' ? '' : size, quantity }
 }
 
 const parseJson = (value, fallback) => {
@@ -409,6 +430,10 @@ export default async function handler(request, response) {
       adminSession = await verifyAdminSession(token)
     } catch {
       return json(response, 401, { error: 'Authentication is required.' })
+    }
+
+    if (resourceName === 'products' || resourceName === 'product-colors') {
+      await ensureProductVariantSchema()
     }
 
     if (resourceName === 'auth' && id === 'logout' && !extra.length && request.method === 'POST') {
@@ -713,15 +738,19 @@ export default async function handler(request, response) {
 
         const incomingImages = productImages(product.image_urls?.length ? product.image_urls : product.image_url)
         const normalizedSku = String(product.sku).trim()
-        const existing = await sql.query('SELECT id, image_url, latest FROM products WHERE LOWER(sku) = LOWER($1) LIMIT 1', [normalizedSku])
+        const existing = await sql.query('SELECT id, image_url, latest, variant_type FROM products WHERE LOWER(sku) = LOWER($1) LIMIT 1', [normalizedSku])
         const resolvedSlug = await uniqueProductSlug(sql, product.slug, normalizedSku, existing[0]?.id)
         const latest = product.latest === undefined || String(product.latest).trim() === ''
           ? existing[0]?.latest || 'F'
           : ['T', 'TRUE', '1', 'Y'].includes(String(product.latest).trim().toUpperCase()) ? 'T' : 'F'
+        const requestedVariantType = String(product.variant_type || '').trim().toUpperCase()
+        const variantType = ['COLOR', 'SIZE', 'BOTH', 'NONE'].includes(requestedVariantType)
+          ? requestedVariantType
+          : existing[0]?.variant_type || 'NONE'
         const values = [
           String(product.name).trim(), resolvedSlug, normalizedSku, categoryId,
           String(product.description || ''), String(product.place || ''), String(product.dimension || ''), Number(product.price), Math.floor(Number(product.stock_quantity)),
-          JSON.stringify(incomingImages), product.is_active !== false, latest,
+          JSON.stringify(incomingImages), product.is_active !== false, latest, variantType,
         ]
         let productId
         let mergedImages = incomingImages
@@ -729,14 +758,14 @@ export default async function handler(request, response) {
           mergedImages = [...new Set([...productImages(existing[0].image_url), ...incomingImages])]
           values[9] = JSON.stringify(mergedImages)
           await sql.query(
-            'UPDATE products SET name = $1, slug = $2, sku = $3, category_id = $4, description = $5, place = $6, dimension = $7, price = $8, stock_quantity = $9, image_url = $10, is_active = $11, latest = $12, updated_at = NOW() WHERE id = $13',
+            'UPDATE products SET name = $1, slug = $2, sku = $3, category_id = $4, description = $5, place = $6, dimension = $7, price = $8, stock_quantity = $9, image_url = $10, is_active = $11, latest = $12, variant_type = $13, updated_at = NOW() WHERE id = $14',
             [...values, existing[0].id],
           )
           productId = existing[0].id
           productResult.updated += 1
         } else {
           const created = await sql.query(
-            'INSERT INTO products (name, slug, sku, category_id, description, place, dimension, price, stock_quantity, image_url, is_active, latest) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id',
+            'INSERT INTO products (name, slug, sku, category_id, description, place, dimension, price, stock_quantity, image_url, is_active, latest, variant_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id',
             values,
           )
           productId = created[0].id
@@ -827,7 +856,11 @@ export default async function handler(request, response) {
     }
 
     if (request.method === 'POST' && !id) {
-      const body = normalizedResourceBody(resourceName, request.body || {})
+      let body = normalizedResourceBody(resourceName, request.body || {})
+      if (resourceName === 'product-colors') {
+        body = await normalizeProductVariantRecord(sql, body)
+        if (body.error) return json(response, 400, { error: body.error })
+      }
       if (resourceName === 'products' && body.optimize_for_mobile === false) return json(response, 400, { error: 'Mobile image optimization is required for products.' })
       if (resourceName === 'users') {
         const requiredFields = ['first_name', 'last_name', 'email', 'country_code', 'role']
@@ -839,7 +872,7 @@ export default async function handler(request, response) {
         body.is_active = false
         body.preferred_notification_channel = 'EMAIL'
       }
-      const columns = resource.columns.filter((column) => availableColumns.includes(column) && body[column] !== undefined && body[column] !== '')
+      const columns = resource.columns.filter((column) => availableColumns.includes(column) && body[column] !== undefined && (body[column] !== '' || (resourceName === 'product-colors' && ['color', 'size'].includes(column))))
       if (!columns.length) return json(response, 400, { error: 'At least one valid field is required.' })
       const values = await prepareValues(resourceName, columns, body)
       const placeholders = values.map((_, index) => `$${index + 1}`).join(', ')
@@ -862,7 +895,13 @@ export default async function handler(request, response) {
     }
 
     if (request.method === 'PUT' && id) {
-      const body = normalizedResourceBody(resourceName, request.body || {})
+      let body = normalizedResourceBody(resourceName, request.body || {})
+      if (resourceName === 'product-colors') {
+        const current = (await sql.query('SELECT * FROM product_color WHERE id=$1', [id]))[0]
+        if (!current) return json(response, 404, { error: 'Record not found.' })
+        body = await normalizeProductVariantRecord(sql, body, current)
+        if (body.error) return json(response, 400, { error: body.error })
+      }
       if (resourceName === 'products' && body.optimize_for_mobile === false) return json(response, 400, { error: 'Mobile image optimization is required for products.' })
       if (resourceName === 'orders' && body.status !== undefined) {
         const status = String(body.status).toUpperCase()
@@ -905,7 +944,7 @@ export default async function handler(request, response) {
         if(body.preferred_notification_channel==='SMS'&&!phone)return json(response,400,{error:'SMS cannot be preferred without an SMS number.'})
         if(body.preferred_notification_channel==='WHATSAPP'&&!whatsapp)return json(response,400,{error:'WhatsApp cannot be preferred without a WhatsApp number.'})
       }
-      const columns = resource.columns.filter((column) => availableColumns.includes(column) && body[column] !== undefined && body[column] !== '')
+      const columns = resource.columns.filter((column) => availableColumns.includes(column) && body[column] !== undefined && (body[column] !== '' || (resourceName === 'product-colors' && ['color', 'size'].includes(column))))
       if (!columns.length) return json(response, 400, { error: 'At least one valid field is required.' })
       const values = await prepareValues(resourceName, columns, body)
       values.push(id)

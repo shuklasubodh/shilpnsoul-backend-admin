@@ -65,6 +65,26 @@ const OrderSummaryEmail=({order,items})=>h(Frame,{preview:`Order ${order.order_n
   h(Heading,{as:'h2',style:{fontSize:'18px',margin:'24px 0 8px'}},'Delivery address'),
   h(Text,{style:{fontSize:'14px',lineHeight:'1.6',whiteSpace:'pre-line'}},order.shipping_address));
 
+const AdminOrderAlertEmail=({admin,order,items})=>h(Frame,{preview:`Paid order ${order.order_number} requires fulfilment.`,title:'A paid order is ready to process'},
+  h(Text,{style:{fontSize:'16px',lineHeight:'1.6'}},`Hello ${admin.first_name || 'Admin'}, order ${order.order_number} has been paid and requires attention.`),
+  h(Section,{style:{backgroundColor:colors.paper,border:`1px solid ${colors.line}`,padding:'16px'}},
+    h(Text,{style:{fontSize:'14px',margin:'0 0 6px'}},`Customer type: ${order.user_id ? 'Registered customer' : 'Guest checkout'}`),
+    h(Text,{style:{fontSize:'14px',margin:'0 0 6px'}},`Name: ${order.shipping_name}`),
+    h(Text,{style:{fontSize:'14px',margin:'0 0 6px'}},`Email: ${order.contact_email || 'Not supplied'}`),
+    h(Text,{style:{fontSize:'14px',margin:'0 0 6px'}},`Phone: ${order.shipping_phone || order.contact_phone || 'Not supplied'}`),
+    h(Text,{style:{fontSize:'14px',margin:'0 0 6px'}},`Payment: ${order.payment_method} / ${order.payment_status}`),
+    h(Text,{style:{fontSize:'14px',margin:0}},`Order status: ${order.status}`)),
+  h(Heading,{as:'h2',style:{fontSize:'18px',margin:'24px 0 8px'}},'Items'),
+  ...items.map(item=>h(Section,{key:item.id,style:{borderBottom:`1px solid ${colors.line}`,padding:'10px 0'}},
+    h(Text,{style:{fontSize:'14px',fontWeight:'700',margin:0}},item.product_name),
+    h(Text,{style:{color:colors.muted,fontSize:'13px',margin:'4px 0 0'}},[
+      item.color&&`Colour: ${item.color}`,item.size&&`Size: ${item.size}`,`Quantity: ${item.quantity}`,
+      `Unit: S$${Number(item.unit_price).toFixed(2)}`,`Subtotal: S$${Number(item.subtotal).toFixed(2)}`,
+    ].filter(Boolean).join(' · ')))),
+  h(Text,{style:{fontSize:'17px',fontWeight:'700',textAlign:'right'}},`Order total S$${Number(order.total_amount).toFixed(2)}`),
+  h(Heading,{as:'h2',style:{fontSize:'18px',margin:'24px 0 8px'}},'Delivery address'),
+  h(Text,{style:{fontSize:'14px',lineHeight:'1.6',whiteSpace:'pre-line'}},order.shipping_address));
+
 const ContactEmail=({name,email,subject,message})=>h(Frame,{preview:`New customer enquiry: ${subject}`,title:'New contact form message'},
   h(Text,{style:{fontSize:'14px',lineHeight:'1.6'}},`From: ${name || 'Storefront visitor'} (${email})`),
   h(Heading,{as:'h2',style:{fontSize:'18px',margin:'24px 0 8px'}},subject),
@@ -128,4 +148,41 @@ export async function sendOrderSummary(order,{resend=false}={}){
     await sql`UPDATE notification_deliveries SET status='FAILED',error_message='Provider delivery failed',updated_at=NOW() WHERE id=${delivery.id}`;
     return {status:'FAILED'};
   }
+}
+
+export async function sendPaidOrderAdminAlerts(orderId){
+  const order=(await sql`SELECT * FROM orders WHERE id=${orderId} AND payment_status='PAID'`)[0];
+  if(!order)return{};
+  const [items,admins]=await Promise.all([
+    sql`SELECT * FROM order_items WHERE order_id=${orderId} ORDER BY id`,
+    sql`SELECT id,first_name,last_name,email FROM users WHERE UPPER(role)='ADMIN' AND is_active=TRUE AND email IS NOT NULL ORDER BY id`,
+  ]);
+  if(!admins.length){console.warn('Paid order has no active administrator email recipient',{orderId});return{}}
+  const results={};
+  for(const admin of admins){
+    const idempotencyKey=`admin-order-alert/${order.id}/${admin.id}`;
+    const delivery=(await sql`INSERT INTO notification_deliveries(order_id,notification_type,channel,destination,provider,status,idempotency_key) VALUES(${order.id},'ADMIN_ORDER_ALERT','EMAIL',${admin.email},'RESEND','PENDING',${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=NOW() RETURNING *`)[0];
+    if(['ACCEPTED','DELIVERED'].includes(delivery.status)){results[admin.id]={status:delivery.status};continue}
+    try{
+      const details=[
+        `Paid order ${order.order_number} requires fulfilment.`,
+        `Customer type: ${order.user_id?'Registered customer':'Guest checkout'}`,
+        `Name: ${order.shipping_name}`,
+        `Email: ${order.contact_email||'Not supplied'}`,
+        `Phone: ${order.shipping_phone||order.contact_phone||'Not supplied'}`,
+        `Payment: ${order.payment_method} / ${order.payment_status}`,
+        `Order status: ${order.status}`,'',
+        ...items.map(item=>[item.product_name,item.color&&`Colour ${item.color}`,item.size&&`Size ${item.size}`,`Quantity ${item.quantity}`,`Unit S$${Number(item.unit_price).toFixed(2)}`,`Subtotal S$${Number(item.subtotal).toFixed(2)}`].filter(Boolean).join(' · ')),
+        '',`Total: S$${Number(order.total_amount).toFixed(2)}`,`Delivery address: ${order.shipping_address}`,
+      ];
+      const data=await sendEmail({to:admin.email,subject:`Paid order ${order.order_number} – action required`,element:h(AdminOrderAlertEmail,{admin,order,items}),text:details.join('\n'),idempotencyKey,tags:[{name:'email_type',value:'admin_order_alert'},{name:'order_id',value:String(order.id)}]});
+      await sql`UPDATE notification_deliveries SET status='ACCEPTED',provider_message_id=${data.id},error_message=NULL,updated_at=NOW() WHERE id=${delivery.id}`;
+      results[admin.id]={status:'ACCEPTED',message_id:data.id};
+    }catch(error){
+      console.error('Paid order administrator alert failed',{orderId:order.id,adminId:admin.id,error:error.message});
+      await sql`UPDATE notification_deliveries SET status='FAILED',error_message='Provider delivery failed',updated_at=NOW() WHERE id=${delivery.id}`;
+      results[admin.id]={status:'FAILED'};
+    }
+  }
+  return results;
 }

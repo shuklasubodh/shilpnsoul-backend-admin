@@ -4,7 +4,9 @@ import sql from './db.js';
 import {admin,authorizeOrderAccess,clearOrderAccessCookie,optionalAuthenticate} from './auth.js';
 import {isId,notFound} from './utils.js';
 import {sendNotificationSummary} from './orders.js';
+import {sendPaidOrderAdminAlerts} from './email.js';
 import {releaseExpiredReservations,releaseInventoryReservation,reservationMinutes} from './inventoryReservations.js';
+import {ensureCommerceReliabilitySchema} from './commerceReliability.js';
 
 let client;
 let accountVerification;
@@ -47,6 +49,7 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
   let event;
   try{event=stripe.webhooks.constructEvent(req.body,signature,process.env.STRIPE_WEBHOOK_SECRET)}
   catch{return res.status(400).json({error:'Invalid Stripe signature.'})}
+  await ensureCommerceReliabilitySchema();
 
   const replay=(await sql`SELECT event_id FROM stripe_webhook_events WHERE event_id=${event.id}`)[0];
   if(replay)return res.json({received:true,duplicate:true});
@@ -72,10 +75,18 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
       if(paidEvents.length){
         await sql`UPDATE payments SET status='PAID',stripe_payment_intent_id=${String(session.payment_intent||'')},paid_at=NOW(),updated_at=NOW() WHERE order_id=${order.id} AND stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
         await ensurePaidOrderNotification(order.id);
-      }else if(session.payment_intent){
-        await stripe.refunds.create({payment_intent:String(session.payment_intent),reason:'requested_by_customer'},{idempotencyKey:'expired-reservation-'+order.id+'-'+session.id});
-        await sql`UPDATE payments SET status='FAILED',updated_at=NOW() WHERE order_id=${order.id} AND stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
-        await releaseInventoryReservation(order.id,'LATE_PAYMENT_REFUNDED');
+        await sendPaidOrderAdminAlerts(order.id);
+      }else{
+        const current=(await sql`SELECT payment_status FROM orders WHERE id=${order.id}`)[0];
+        if(current?.payment_status==='PAID'){
+          await sql`UPDATE payments SET status='PAID',stripe_payment_intent_id=${String(session.payment_intent||'')},paid_at=COALESCE(paid_at,NOW()),updated_at=NOW() WHERE order_id=${order.id} AND stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
+          await ensurePaidOrderNotification(order.id);
+          await sendPaidOrderAdminAlerts(order.id);
+        }else if(session.payment_intent){
+          await stripe.refunds.create({payment_intent:String(session.payment_intent),reason:'requested_by_customer'},{idempotencyKey:'expired-reservation-'+order.id+'-'+session.id});
+          await sql`UPDATE payments SET status='FAILED',updated_at=NOW() WHERE order_id=${order.id} AND stripe_checkout_session_id=${session.id} AND status<>'PAID'`;
+          await releaseInventoryReservation(order.id,'LATE_PAYMENT_REFUNDED');
+        }
       }
     }
   }else if(event.type==='checkout.session.async_payment_failed'||event.type==='checkout.session.expired'){
@@ -86,6 +97,7 @@ stripeWebhook.post('/',raw({type:'application/json',limit:'256kb'}),async(req,re
 });
 
 const router=Router();
+router.use(async(req,res,next)=>{try{await ensureCommerceReliabilitySchema();return next()}catch(error){return next(error)}});
 router.use(optionalAuthenticate);
 const checkoutResult=async(req,res)=>{
   const sessionId=String(req.params.sessionId||req.body?.session_id||'').trim();
@@ -175,14 +187,19 @@ router.put('/orders/:id/cash',admin,async(req,res)=>{
   if(order.status==='CANCELLED')return res.status(409).json({error:'Cancelled orders cannot be paid.'});
   if(order.payment_status!=='PAID'){
     await sql`INSERT INTO payments(order_id,user_id,provider,method,status,amount,currency,paid_at) VALUES(${order.id},${order.user_id},'CASH','CASH','PAID',${order.total_amount},${currency().toUpperCase()},NOW()) ON CONFLICT (order_id) WHERE status='PAID' DO NOTHING`;
-    await sql`
+    const paidEvents=await sql`
       WITH paid AS (
         UPDATE orders SET payment_status='PAID',status=CASE WHEN status='PENDING' THEN 'CONFIRMED' ELSE status END,updated_at=NOW()
         WHERE id=${order.id} AND payment_status<>'PAID' RETURNING id,status
       )
       INSERT INTO order_events(order_id,event_type,from_payment_status,to_payment_status,to_status,actor_type,actor_id,metadata)
       SELECT id,'PAYMENT_STATUS_CHANGED',${order.payment_status},'PAID',status,'ADMIN',${req.user.id},jsonb_build_object('provider','CASH') FROM paid
+      RETURNING order_id
     `;
+    if(paidEvents.length){
+      await ensurePaidOrderNotification(order.id);
+      await sendPaidOrderAdminAlerts(order.id);
+    }
   }
   return res.json((await sql`SELECT * FROM orders WHERE id=${order.id}`)[0]);
 });

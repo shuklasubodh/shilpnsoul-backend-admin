@@ -9,9 +9,10 @@ import {notFound} from './utils.js';
 import {notificationChannelsFor,returnDeadlineOpen,validCheckoutId,verificationMatches} from './checkoutPolicy.js';
 import {releaseExpiredReservations,reservationMinutes} from './inventoryReservations.js';
 import {ensureProductVariantSchema} from './productVariants.js';
+import {ensureCommerceReliabilitySchema} from './commerceReliability.js';
 
 const router=Router();
-router.use(async(req,res,next)=>{try{await ensureProductVariantSchema();return next()}catch(error){return next(error)}});
+router.use(async(req,res,next)=>{try{await Promise.all([ensureProductVariantSchema(),ensureCommerceReliabilitySchema()]);return next()}catch(error){return next(error)}});
 const codeHash=(code,destination,nonce)=>crypto.createHmac('sha256',authSecret()).update(`${code}:${destination}:${nonce}`).digest('hex');
 const safeEqual=(left,right)=>{const a=Buffer.from(String(left)),b=Buffer.from(String(right));return a.length===b.length&&crypto.timingSafeEqual(a,b)};
 
@@ -73,6 +74,30 @@ const createOrder=async(req,res,user=null)=>{
   await releaseExpiredReservations();
   const {shipping_name,shipping_phone,shipping_address}=req.body;
   const items=req.body.items;
+  const requestId=String(req.body.checkout_request_id||'').trim();
+  const subjectType=user?'CUSTOMER':'GUEST';
+  const subjectId=user?String(user.id):String(req.body.checkout_id||'').trim();
+  if(!validCheckoutId(requestId))return res.status(400).json({error:'A valid checkout request reference is required.',code:'CHECKOUT_REQUEST_INVALID'});
+  if(!user&&!validCheckoutId(subjectId))return res.status(403).json({error:'A valid checkout reference is required. Verify the contact again.'});
+  const findExisting=async()=>{
+    const record=(await sql`SELECT o.* FROM checkout_requests cr JOIN orders o ON o.id=cr.order_id WHERE cr.request_id=${requestId}::uuid AND cr.subject_type=${subjectType} AND cr.subject_id=${subjectId}`)[0];
+    return record||null;
+  };
+  const respond=async(order,statusCode,notification)=>{
+    order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id} ORDER BY id`;
+    if(notification!==undefined)order.notification=notification;
+    if(!user){
+      const access=await orderAccessTokenFor(order,{scopes:['CHECKOUT','PAYMENT_READ','RELEASE','READ','RESEND','ACTION'],expiresAt:new Date(new Date(order.inventory_reserved_until).getTime()+15*60*1000)});
+      setOrderAccessCookie(res,order.id,access.token,access.expiresAt);
+      order.order_access_csrf_token=access.csrfToken;
+    }
+    const response={...order,reservation_minutes:reservationMinutes(),idempotent_replay:statusCode===200};
+    if(response.payment_status!=='PAID')delete response.order_number;
+    return res.status(statusCode).json(response);
+  };
+  const existingOrder=await findExisting();
+  if(existingOrder)return respond(existingOrder,200);
+
   const paymentMethod=String(req.body.payment_method||'CASH').toUpperCase();
   if(!['CASH','STRIPE'].includes(paymentMethod))return res.status(400).json({error:'Payment method must be CASH or STRIPE.'});
   if(!shipping_name||!shipping_address||!Array.isArray(items)||!items.length)return res.status(400).json({error:'Shipping name, address, and items are required.'});
@@ -84,34 +109,37 @@ const createOrder=async(req,res,user=null)=>{
   const deliveryPhone=normalizeWhatsAppNumber(shipping_phone)||contactPhone||null;
   const returnWindowDays=user?Number(user.return_window_days):2;
   const requested=new Map();
-  let total=0;
   for(const item of items){
     const product=(await sql`SELECT p.*,pc.id product_color_id,pc.color,pc.size,pc.quantity variant_quantity FROM products p LEFT JOIN product_color pc ON pc.product_id=p.id AND pc.id=${item.product_color_id} WHERE p.id=${item.product_id} AND p.is_active=true`)[0];
     const quantity=Number(item.quantity);
-    if(!product||!Number.isInteger(quantity)||quantity<1)return res.status(409).json({error:'Product or quantity is invalid.'});
+    if(!product||!Number.isInteger(quantity)||quantity<1)return res.status(409).json({error:'Product or quantity is invalid.',code:'INVENTORY_CHANGED'});
     const requiresVariant=product.variant_type!=='NONE';
-    if(requiresVariant&&!product.product_color_id)return res.status(409).json({error:`Select the required options for ${product.name}.`});
-    if(!requiresVariant&&item.product_color_id!=null)return res.status(409).json({error:`${product.name} does not have color or size options.`});
+    if(requiresVariant&&!product.product_color_id)return res.status(409).json({error:`Select the required options for ${product.name}.`,code:'INVENTORY_CHANGED'});
+    if(!requiresVariant&&item.product_color_id!=null)return res.status(409).json({error:`${product.name} does not have color or size options.`,code:'INVENTORY_CHANGED'});
     const available=Number(requiresVariant?product.variant_quantity:product.stock_quantity);
     const option=[product.color,product.size].filter(Boolean).join(' / ');
-    if(quantity>available)return res.status(409).json({error:`Insufficient stock for ${product.name}${option?` (${option})`:''}.`});
+    if(quantity>available)return res.status(409).json({error:`Insufficient stock for ${product.name}${option?` (${option})`:''}.`,code:'INVENTORY_CHANGED'});
     const key=product.product_color_id?`variant:${product.product_color_id}`:`product:${product.id}`,existing=requested.get(key);
     requested.set(key,{product_id:product.id,product_color_id:product.product_color_id||null,quantity:(existing?.quantity||0)+quantity,product_name:product.name,color:product.color||null,size:product.size||null,unit_price:Number(product.price)});
   }
   const prepared=[...requested.values()];
   const subtotal=prepared.reduce((sum,item)=>sum+item.unit_price*item.quantity,0);
   const delivery=subtotal>=30?0:5;
-  total=subtotal+delivery;
+  const total=subtotal+delivery;
   const number=`ORD-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
   const payload=JSON.stringify(prepared);
   const created=await sql.query(`
-    WITH contact_locks AS MATERIALIZED (
+    WITH request_claim AS MATERIALIZED (
+      INSERT INTO checkout_requests(request_id,subject_type,subject_id)
+      VALUES($19::uuid,$13,$20)
+      ON CONFLICT(request_id) DO NOTHING RETURNING request_id
+    ), contact_locks AS MATERIALIZED (
       SELECT pg_advisory_xact_lock(hashtextextended(identity_key,0))
-      FROM unnest(ARRAY['email:'||LOWER($8),CASE WHEN $9::text IS NULL THEN NULL ELSE 'phone:'||$9 END,CASE WHEN $15::text IS NULL THEN NULL ELSE 'phone:'||$15 END]) identity_key
+      FROM unnest(ARRAY['email:'||LOWER($8),CASE WHEN $9::text IS NULL THEN NULL ELSE 'phone:'||$9 END,CASE WHEN $15::text IS NULL THEN NULL ELSE 'phone:'||$15 END]) identity_key,request_claim
       WHERE identity_key IS NOT NULL ORDER BY identity_key
     ), contacts_ok AS MATERIALIZED (
       SELECT NOT EXISTS(
-        SELECT 1 FROM users, (SELECT COUNT(*) FROM contact_locks) locks
+        SELECT 1 FROM users,(SELECT COUNT(*) FROM contact_locks) locks
         WHERE ($2::bigint IS NULL OR id<>$2)
           AND (LOWER(email)=LOWER($8) OR ($9::text IS NOT NULL AND (phone=$9 OR whatsapp_number=$9)) OR ($15::text IS NOT NULL AND (phone=$15 OR whatsapp_number=$15)))
       ) ok
@@ -119,24 +147,23 @@ const createOrder=async(req,res,user=null)=>{
       SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(product_id bigint,product_color_id bigint,quantity integer,product_name text,color text,size text,unit_price numeric)
     ), locked_colors AS MATERIALIZED (
       SELECT pc.id,pc.product_id,pc.quantity available,r.quantity requested_quantity
-      FROM product_color pc JOIN requested r ON r.product_color_id=pc.id AND r.product_id=pc.product_id
+      FROM product_color pc JOIN requested r ON r.product_color_id=pc.id AND r.product_id=pc.product_id CROSS JOIN request_claim
       ORDER BY pc.id FOR UPDATE OF pc
     ), locked_products AS MATERIALIZED (
       SELECT p.id,p.stock_quantity available,r.quantity requested_quantity
-      FROM products p JOIN requested r ON r.product_id=p.id AND r.product_color_id IS NULL
+      FROM products p JOIN requested r ON r.product_id=p.id AND r.product_color_id IS NULL CROSS JOIN request_claim
       ORDER BY p.id FOR UPDATE OF p
     ), inventory AS MATERIALIZED (
-      SELECT available,requested_quantity FROM locked_colors
-      UNION ALL
-      SELECT available,requested_quantity FROM locked_products
+      SELECT available,requested_quantity FROM locked_colors UNION ALL SELECT available,requested_quantity FROM locked_products
     ), eligible AS MATERIALIZED (
       SELECT COUNT(*)=(SELECT COUNT(*) FROM requested) AND COALESCE(BOOL_AND(available>=requested_quantity),false) ok FROM inventory
     ), consumed_verifications AS (
       UPDATE notification_verifications SET consumed_at=NOW()
-      WHERE id=ANY($18::bigint[]) AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at>NOW() AND (SELECT ok FROM eligible) AND (SELECT ok FROM contacts_ok)
+      WHERE id=ANY($18::bigint[]) AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at>NOW()
+        AND EXISTS(SELECT 1 FROM request_claim) AND (SELECT ok FROM eligible) AND (SELECT ok FROM contacts_ok)
       RETURNING id
     ), proofs_ok AS MATERIALIZED (
-      SELECT COUNT(*)=cardinality($18::bigint[]) ok FROM consumed_verifications
+      SELECT COUNT(*)=cardinality($18::bigint[]) AND EXISTS(SELECT 1 FROM request_claim) ok FROM consumed_verifications
     ), reduced_colors AS (
       UPDATE product_color pc SET quantity=pc.quantity-r.quantity,updated_at=NOW()
       FROM requested r,eligible e,proofs_ok v WHERE e.ok AND v.ok AND r.product_color_id IS NOT NULL AND pc.id=r.product_color_id RETURNING pc.id
@@ -145,7 +172,8 @@ const createOrder=async(req,res,user=null)=>{
       FROM requested r,eligible e,proofs_ok v WHERE e.ok AND v.ok AND r.product_color_id IS NULL AND p.id=r.product_id RETURNING p.id
     ), new_order AS (
       INSERT INTO orders(user_id,order_number,status,shipping_name,shipping_phone,shipping_address,total_amount,contact_email,contact_phone,contact_whatsapp,payment_method,payment_status,notification_channel,notification_destination,return_window_days,inventory_reserved_at,inventory_reserved_until,notification_channels)
-      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$15,$10,'UNPAID',$11,$12,$14,NOW(),NOW()+($16::int*INTERVAL '1 minute'),$17 FROM eligible,proofs_ok,contacts_ok WHERE eligible.ok AND proofs_ok.ok AND contacts_ok.ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
+      SELECT $2,$3,'PENDING',$4,$5,$6,$7,$8,$9,$15,$10,'UNPAID',$11,$12,$14,NOW(),NOW()+($16::int*INTERVAL '1 minute'),$17 FROM eligible,proofs_ok,contacts_ok
+      WHERE eligible.ok AND proofs_ok.ok AND contacts_ok.ok AND (SELECT COUNT(*) FROM reduced_colors)+(SELECT COUNT(*) FROM reduced_products)=(SELECT COUNT(*) FROM requested)
       RETURNING *
     ), new_items AS (
       INSERT INTO order_items(order_id,product_id,product_color_id,color,size,product_name,quantity,unit_price,subtotal)
@@ -153,16 +181,24 @@ const createOrder=async(req,res,user=null)=>{
     ), new_event AS (
       INSERT INTO order_events(order_id,event_type,to_status,to_payment_status,actor_type,actor_id)
       SELECT id,'ORDER_CREATED','PENDING','UNPAID',$13,$2 FROM new_order RETURNING id
-    ) SELECT * FROM new_order WHERE (SELECT COUNT(*) FROM new_items)>0 AND (SELECT COUNT(*) FROM new_event)>0
-  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,'EMAIL',contactEmail,user?'CUSTOMER':'GUEST',returnWindowDays,contactWhatsapp,reservationMinutes(),notification.channels,notification.challengeIds]);
+    ), linked_request AS (
+      UPDATE checkout_requests cr SET order_id=o.id,updated_at=NOW() FROM new_order o
+      WHERE cr.request_id=$19::uuid AND cr.order_id IS NULL RETURNING cr.order_id
+    ), released_claim AS (
+      DELETE FROM checkout_requests cr WHERE cr.request_id=$19::uuid AND cr.order_id IS NULL
+        AND EXISTS(SELECT 1 FROM request_claim) AND NOT EXISTS(SELECT 1 FROM linked_request) RETURNING cr.request_id
+    )
+    SELECT * FROM new_order WHERE (SELECT COUNT(*) FROM new_items)>0 AND (SELECT COUNT(*) FROM new_event)>0
+      AND (SELECT COUNT(*) FROM linked_request)>0 AND (SELECT COUNT(*) FROM released_claim)>=0
+  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,'EMAIL',contactEmail,subjectType,returnWindowDays,contactWhatsapp,reservationMinutes(),notification.channels,notification.challengeIds,requestId,subjectId]);
   const order=created[0];
-  if(!order)return res.status(409).json({error:'Inventory changed or a contact verification was already used. Review the order and verify again if needed.'});
-  order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id}`;
-  order.notification=paymentMethod==='STRIPE'?{status:'PENDING_PAYMENT'}:await sendNotificationSummary(order);
-  if(!user){const access=await orderAccessTokenFor(order,{scopes:['CHECKOUT','PAYMENT_READ','RELEASE','READ','RESEND','ACTION'],expiresAt:new Date(new Date(order.inventory_reserved_until).getTime()+15*60*1000)});setOrderAccessCookie(res,order.id,access.token,access.expiresAt);order.order_access_csrf_token=access.csrfToken}
-  const response={...order,reservation_minutes:reservationMinutes()};
-  if(response.payment_status!=='PAID')delete response.order_number;
-  return res.status(201).json(response);
+  if(!order){
+    const replay=await findExisting();
+    if(replay)return respond(replay,200);
+    return res.status(409).json({error:'Inventory changed while this order was being reserved. Review current availability and try again.',code:'INVENTORY_CHANGED'});
+  }
+  const orderNotification=paymentMethod==='STRIPE'?{status:'PENDING_PAYMENT'}:await sendNotificationSummary({...order,items:await sql`SELECT * FROM order_items WHERE order_id=${order.id} ORDER BY id`});
+  return respond(order,201,orderNotification);
 };
 
 const resendOrderSummary=async(res,order)=>{

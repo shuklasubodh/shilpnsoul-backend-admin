@@ -5,12 +5,13 @@ import { releaseExpiredReservations } from './inventoryReservations.js'
 import { authenticate, optionalAuthenticate, admin } from './auth.js'
 import { notFound, page } from './utils.js'
 import { ensureProductVariantSchema } from './productVariants.js'
+import { ensureCommerceReliabilitySchema } from './commerceReliability.js'
 
 const router = Router()
 router.use(async (req, res, next) => {
   if (!/^\/(products|product-colors)(?:\/|$)/.test(req.path)) return next()
   try {
-    await ensureProductVariantSchema()
+    await Promise.all([ensureProductVariantSchema(), ensureCommerceReliabilitySchema()])
     return next()
   } catch (error) {
     return next(error)

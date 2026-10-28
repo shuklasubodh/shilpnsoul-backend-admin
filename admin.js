@@ -806,7 +806,24 @@ export default async function handler(request, response) {
     if (request.method === 'GET' && id) {
       const rows = await sql.query(`SELECT ${selectColumns} FROM "${resource.table}" WHERE id = $1`, [id])
       if (!rows.length) return json(response, 404, { error: 'Record not found.' })
-      return json(response, 200, publicRecord(resourceName, rows[0]))
+      const record = publicRecord(resourceName, rows[0])
+      if (resourceName === 'orders') {
+        const items = await sql.query(`
+          SELECT oi.*,
+            COALESCE(NULLIF(oi.product_name, ''), p.name) AS product_name,
+            p.sku,
+            p.image_url
+          FROM order_items oi
+          LEFT JOIN products p ON p.id = oi.product_id
+          WHERE oi.order_id = $1
+          ORDER BY oi.id
+        `, [id])
+        record.items = items.map((item) => ({
+          ...item,
+          image_url: productImages(item.image_url)[0] || '',
+        }))
+      }
+      return json(response, 200, record)
     }
 
     if (request.method === 'GET') {

@@ -83,6 +83,32 @@ const createOrder=async(req,res,user=null)=>{
     const record=(await sql`SELECT o.* FROM checkout_requests cr JOIN orders o ON o.id=cr.order_id WHERE cr.request_id=${requestId}::uuid AND cr.subject_type=${subjectType} AND cr.subject_id=${subjectId}`)[0];
     return record||null;
   };
+  const recoverUnlinkedOrder=async()=>{
+    const contactEmail=String(req.body.contact_email||user?.email||'').trim().toLowerCase();
+    const record=(await sql.query(`
+      WITH candidate AS (
+        SELECT o.id
+        FROM checkout_requests cr
+        JOIN orders o ON o.user_id IS NULL
+          AND o.status='PENDING' AND o.payment_status='UNPAID'
+          AND o.inventory_reserved_until>NOW()
+          AND LOWER(o.contact_email)=LOWER($4)
+          AND o.shipping_name=$5 AND o.shipping_address=$6
+          AND o.created_at>=cr.created_at AND o.created_at<cr.created_at+INTERVAL '30 seconds'
+        WHERE cr.request_id=$1::uuid AND cr.subject_type=$2 AND cr.subject_id=$3 AND cr.order_id IS NULL
+          AND NOT EXISTS(SELECT 1 FROM checkout_requests linked WHERE linked.order_id=o.id)
+        ORDER BY o.created_at
+        LIMIT 1
+      ), recovered AS (
+        UPDATE checkout_requests cr SET order_id=candidate.id,updated_at=NOW()
+        FROM candidate
+        WHERE cr.request_id=$1::uuid AND cr.subject_type=$2 AND cr.subject_id=$3 AND cr.order_id IS NULL
+        RETURNING cr.order_id
+      )
+      SELECT o.* FROM recovered JOIN orders o ON o.id=recovered.order_id
+    `,[requestId,subjectType,subjectId,contactEmail,shipping_name,shipping_address]))[0];
+    return record||null;
+  };
   const respond=async(order,statusCode,notification)=>{
     order.items=await sql`SELECT * FROM order_items WHERE order_id=${order.id} ORDER BY id`;
     if(notification!==undefined)order.notification=notification;
@@ -97,6 +123,8 @@ const createOrder=async(req,res,user=null)=>{
   };
   const existingOrder=await findExisting();
   if(existingOrder)return respond(existingOrder,200);
+  const recoveredOrder=!user?await recoverUnlinkedOrder():null;
+  if(recoveredOrder)return respond(recoveredOrder,200);
 
   const paymentMethod=String(req.body.payment_method||'CASH').toUpperCase();
   if(!['CASH','STRIPE'].includes(paymentMethod))return res.status(400).json({error:'Payment method must be CASH or STRIPE.'});
@@ -128,11 +156,22 @@ const createOrder=async(req,res,user=null)=>{
   const total=subtotal+delivery;
   const number=`ORD-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
   const payload=JSON.stringify(prepared);
-  const created=await sql.query(`
+  const claimed=(await sql.query(`
+    INSERT INTO checkout_requests(request_id,subject_type,subject_id)
+    VALUES($1::uuid,$2,$3)
+    ON CONFLICT(request_id) DO NOTHING
+    RETURNING request_id
+  `,[requestId,subjectType,subjectId]))[0];
+  if(!claimed){
+    const replay=await findExisting();
+    if(replay)return respond(replay,200);
+    return res.status(409).json({error:'This checkout request is already being processed. Please wait a moment and try again.',code:'CHECKOUT_IN_PROGRESS'});
+  }
+  let created;
+  try{created=await sql.query(`
     WITH request_claim AS MATERIALIZED (
-      INSERT INTO checkout_requests(request_id,subject_type,subject_id)
-      VALUES($19::uuid,$13,$20)
-      ON CONFLICT(request_id) DO NOTHING RETURNING request_id
+      SELECT request_id FROM checkout_requests
+      WHERE request_id=$19::uuid AND subject_type=$13 AND subject_id=$20 AND order_id IS NULL
     ), contact_locks AS MATERIALIZED (
       SELECT pg_advisory_xact_lock(hashtextextended(identity_key,0))
       FROM unnest(ARRAY['email:'||LOWER($8),CASE WHEN $9::text IS NULL THEN NULL ELSE 'phone:'||$9 END,CASE WHEN $15::text IS NULL THEN NULL ELSE 'phone:'||$15 END]) identity_key,request_claim
@@ -184,17 +223,19 @@ const createOrder=async(req,res,user=null)=>{
     ), linked_request AS (
       UPDATE checkout_requests cr SET order_id=o.id,updated_at=NOW() FROM new_order o
       WHERE cr.request_id=$19::uuid AND cr.order_id IS NULL RETURNING cr.order_id
-    ), released_claim AS (
-      DELETE FROM checkout_requests cr WHERE cr.request_id=$19::uuid AND cr.order_id IS NULL
-        AND EXISTS(SELECT 1 FROM request_claim) AND NOT EXISTS(SELECT 1 FROM linked_request) RETURNING cr.request_id
     )
     SELECT * FROM new_order WHERE (SELECT COUNT(*) FROM new_items)>0 AND (SELECT COUNT(*) FROM new_event)>0
-      AND (SELECT COUNT(*) FROM linked_request)>0 AND (SELECT COUNT(*) FROM released_claim)>=0
-  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,'EMAIL',contactEmail,subjectType,returnWindowDays,contactWhatsapp,reservationMinutes(),notification.channels,notification.challengeIds,requestId,subjectId]);
+      AND (SELECT COUNT(*) FROM linked_request)>0
+  `,[payload,user?.id||null,number,shipping_name,deliveryPhone,shipping_address,total.toFixed(2),contactEmail,contactPhone,paymentMethod,'EMAIL',contactEmail,subjectType,returnWindowDays,contactWhatsapp,reservationMinutes(),notification.channels,notification.challengeIds,requestId,subjectId])}
+  catch(error){
+    await sql`DELETE FROM checkout_requests WHERE request_id=${requestId}::uuid AND subject_type=${subjectType} AND subject_id=${subjectId} AND order_id IS NULL`;
+    throw error;
+  }
   const order=created[0];
   if(!order){
     const replay=await findExisting();
     if(replay)return respond(replay,200);
+    await sql`DELETE FROM checkout_requests WHERE request_id=${requestId}::uuid AND subject_type=${subjectType} AND subject_id=${subjectId} AND order_id IS NULL`;
     return res.status(409).json({error:'Inventory changed while this order was being reserved. Review current availability and try again.',code:'INVENTORY_CHANGED'});
   }
   const orderNotification=paymentMethod==='STRIPE'?{status:'PENDING_PAYMENT'}:await sendNotificationSummary({...order,items:await sql`SELECT * FROM order_items WHERE order_id=${order.id} ORDER BY id`});
